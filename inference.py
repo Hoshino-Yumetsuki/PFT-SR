@@ -1,7 +1,6 @@
 import torch
 import os
 import os.path as osp
-import sys
 import argparse
 from tqdm import tqdm
 
@@ -56,18 +55,6 @@ def get_parser(**parser_kwargs):
         help="Disable torch.compile.",
     )
     parser.add_argument(
-        "--fp16",
-        action="store_true",
-        default=True,
-        help="Enable FP16 mixed precision inference. Use --no-fp16 to disable.",
-    )
-    parser.add_argument(
-        "--no-fp16",
-        action="store_false",
-        dest="fp16",
-        help="Disable FP16 mixed precision.",
-    )
-    parser.add_argument(
         "--patch-size",
         type=int,
         default=128,
@@ -78,7 +65,7 @@ def get_parser(**parser_kwargs):
     return args
 
 
-def patchwise_inference(img, model, patch_size, scale, fp16, device):
+def patchwise_inference(img, model, patch_size, scale):
     import torch.nn.functional as F
 
     _, C, h, w = img.size()
@@ -109,11 +96,7 @@ def patchwise_inference(img, model, patch_size, scale, fp16, device):
     outputs = []
     for top, left in tqdm(slices, desc="Processing patches", unit="patch"):
         patch = img[..., top, left]
-        if fp16 and device != "cpu":
-            with torch.amp.autocast('cuda'):
-                out = model(patch)
-        else:
-            out = model(patch)
+        out = model(patch)
         outputs.append(out)
 
     result = torch.zeros(1, C, H * scale, W * scale, device=img.device)
@@ -138,7 +121,7 @@ def patchwise_inference(img, model, patch_size, scale, fp16, device):
 
 
 def process_image(
-    image_input_path, image_output_path, model, device, scale, patch_size=0, fp16=False
+    image_input_path, image_output_path, model, device, scale, patch_size=0
 ):
     with torch.no_grad():
         image_input = Image.open(image_input_path).convert("RGB")
@@ -146,15 +129,11 @@ def process_image(
 
         if patch_size > 0:
             image_output = patchwise_inference(
-                image_input, model, patch_size, scale, fp16, device
+                image_input, model, patch_size, scale
             )
-            image_output = torch.nan_to_num(image_output).clamp(0.0, 1.0)[0].cpu()
+            image_output = image_output.clamp(0.0, 1.0)[0].cpu()
         else:
-            if fp16 and device != "cpu":
-                with torch.amp.autocast('cuda'):
-                    image_output = torch.nan_to_num(model(image_input)).clamp(0.0, 1.0)[0].cpu()
-            else:
-                image_output = torch.nan_to_num(model(image_input)).clamp(0.0, 1.0)[0].cpu()
+            image_output = model(image_input).clamp(0.0, 1.0)[0].cpu()
 
         image_output = transforms.ToPILImage()(image_output)
         image_output.save(image_output_path)
@@ -282,7 +261,6 @@ def main():
                     device,
                     args.scale,
                     args.patch_size,
-                    args.fp16,
                 )
     else:
         if (
@@ -308,7 +286,6 @@ def main():
                 device,
                 args.scale,
                 args.patch_size,
-                args.fp16,
             )
 
 
