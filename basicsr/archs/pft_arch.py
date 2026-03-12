@@ -101,21 +101,29 @@ class SMM_AmV(Function):
 # ---------------------------------------------------------------------------
 
 def _smm_qmk_infer(q: torch.Tensor, k: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
-    """Sparse Q @ K^T for inference.  q,k: (BH,N,C)  index: (BH,N,topk) int64"""
+    """Sparse Q @ K^T for inference.  q,k: (BH,N,C)  index: (BH,N,topk) int64
+    Uses a single 4-D batched matmul (BH, N, 1, C) @ (BH, N, C, topk) so that
+    cuBLAS can schedule all heads and windows in one kernel launch.
+    """
     BH, N, topk = index.shape
     C = q.shape[-1]
     idx = index.reshape(BH, N * topk, 1).expand(BH, N * topk, C)
-    k_sel = torch.gather(k, 1, idx).view(BH * N, topk, C)          # (BH*N, topk, C)
-    return torch.bmm(q.reshape(BH * N, 1, C), k_sel.transpose(1, 2)).view(BH, N, topk)
+    k_sel = torch.gather(k, 1, idx).view(BH, N, topk, C)   # (BH, N, topk, C)
+    # (BH, N, 1, C) @ (BH, N, C, topk) -> (BH, N, 1, topk) -> (BH, N, topk)
+    return (q.unsqueeze(2) @ k_sel.transpose(-1, -2)).squeeze(2)
 
 
 def _smm_amv_infer(attn: torch.Tensor, v: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
-    """Sparse Attn @ V for inference.  attn: (BH,N,topk)  v: (BH,N,C)  index: (BH,N,topk) int64"""
+    """Sparse Attn @ V for inference.  attn: (BH,N,topk)  v: (BH,N,C)  index: (BH,N,topk) int64
+    Uses a single 4-D batched matmul (BH, N, 1, topk) @ (BH, N, topk, C) so that
+    cuBLAS can schedule all heads and windows in one kernel launch.
+    """
     BH, N, topk = index.shape
     C = v.shape[-1]
     idx = index.reshape(BH, N * topk, 1).expand(BH, N * topk, C)
-    v_sel = torch.gather(v, 1, idx).view(BH * N, topk, C)          # (BH*N, topk, C)
-    return torch.bmm(attn.reshape(BH * N, 1, topk), v_sel).view(BH, N, C)
+    v_sel = torch.gather(v, 1, idx).view(BH, N, topk, C)   # (BH, N, topk, C)
+    # (BH, N, 1, topk) @ (BH, N, topk, C) -> (BH, N, 1, C) -> (BH, N, C)
+    return (attn.unsqueeze(2) @ v_sel).squeeze(2)
 
 
 class dwconv(nn.Module):
@@ -301,22 +309,32 @@ class WindowAttention(nn.Module):
         # Sparse Attention
         else:
             topk_k = pfa_indices[shift].shape[-1]
-            q_flat = q.contiguous().view(b_ * nH, n, hC)
-            k_flat = k.contiguous().view(b_ * nH, n, hC)
-            # Keep indices as int64 — avoids redundant INT32↔INT64 conversions.
-            idx = pfa_indices[shift].view(b_ * nH, n, topk_k)
 
-            if self.training:
-                attn = SMM_QmK.apply(q_flat, k_flat, idx.int()).view(b_, nH, n, topk_k)
+            if topk_k >= n:
+                # topk == N → gather is an identity, use dense attention directly
+                attn = q @ k.transpose(-2, -1)  # (b_, nH, n, n)
+                attn = attn + rpb
+                if shift and mask is not None:
+                    nw = mask.shape[0]
+                    attn = attn.view(b_ // nw, nw, nH, n, n) + mask.unsqueeze(1).unsqueeze(0)
+                    attn = attn.view(-1, nH, n, n)
             else:
-                attn = _smm_qmk_infer(q_flat, k_flat, idx).view(b_, nH, n, topk_k)
+                q_flat = q.contiguous().view(b_ * nH, n, hC)
+                k_flat = k.contiguous().view(b_ * nH, n, hC)
+                # Keep indices as int64 — avoids redundant INT32↔INT64 conversions.
+                idx = pfa_indices[shift].view(b_ * nH, n, topk_k)
 
-            # Gather sparse RPB: rpb.expand() is zero-copy; only the gather
-            # output (b_, nH, n, topk_k) is materialised — avoids O(N²) alloc.
-            rpb_sparse = torch.gather(
-                rpb.expand(b_, -1, n, n), dim=-1, index=pfa_indices[shift]
-            )  # (b_, nH, n, topk_k)
-            attn = attn + rpb_sparse
+                if self.training:
+                    attn = SMM_QmK.apply(q_flat, k_flat, idx.int()).view(b_, nH, n, topk_k)
+                else:
+                    attn = _smm_qmk_infer(q_flat, k_flat, idx).view(b_, nH, n, topk_k)
+
+                # Gather sparse RPB: rpb may have nH_or_1==1 (shared across heads),
+                # so expand both batch and head dims explicitly.
+                rpb_sparse = torch.gather(
+                    rpb.expand(b_, nH, n, n), dim=-1, index=pfa_indices[shift]
+                )  # (b_, nH, n, topk_k)
+                attn = attn + rpb_sparse
 
         # Softmax
         attn = torch.softmax(attn, dim=-1)
@@ -343,7 +361,8 @@ class WindowAttention(nn.Module):
         pfa_values[shift] = attn
 
         # Attn @ V
-        if pfa_indices[shift] is None:
+        if pfa_indices[shift] is None or pfa_indices[shift].shape[-1] >= n:
+            # Dense attention (either first pass, or topk == N degenerate case)
             x = ((attn @ v) + v_lepe).transpose(1, 2).reshape(b_, n, c)
         else:
             topk_v = pfa_indices[shift].shape[-1]

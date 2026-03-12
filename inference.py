@@ -2,6 +2,7 @@ import torch
 import os
 import os.path as osp
 import argparse
+import torch.nn.functional as F
 from tqdm import tqdm
 
 from PIL import Image
@@ -48,80 +49,114 @@ def get_parser(**parser_kwargs):
         default=False,
         help="Enable torch.compile (experimental, may not work with custom ops).",
     )
-    parser.add_argument(
-        "--no-compile",
-        action="store_false",
-        dest="compile",
-        help="Disable torch.compile.",
-    )
+    # parser.add_argument(
+    #     "--no-compile",
+    #     action="store_false",
+    #     dest="compile",
+    #     help="Disable torch.compile.",
+    # )
     parser.add_argument(
         "--patch-size",
         type=int,
         default=128,
-        help="Patch size for patchwise inference. Use 0 to disable patchwise inference.",
+        help="Patch size for patchwise inference. Larger = fewer patches = faster overall (less kernel launch overhead). "
+             "Use 0 to disable. Rule of thumb for 8 GB VRAM: 256 (safe), 384 (faster), 512 (may OOM on dense-attention layers).",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Number of patches to process in parallel. Higher = faster but uses MUCH more VRAM. Default 1 is safest for 8 GB GPUs.",
     )
     args = parser.parse_args()
 
     return args
 
 
-def patchwise_inference(img, model, patch_size, scale):
-    import torch.nn.functional as F
-
+def patchwise_inference(img, model, patch_size, scale, batch_size=4):
     _, C, h, w = img.size()
-    split_token_h = h // patch_size + 1
-    split_token_w = w // patch_size + 1
 
-    mod_pad_h = (split_token_h - h % split_token_h) if h % split_token_h != 0 else 0
-    mod_pad_w = (split_token_w - w % split_token_w) if w % split_token_w != 0 else 0
-    img = F.pad(img, (0, mod_pad_w, 0, mod_pad_h), "reflect")
+    # Number of tiles in each dimension
+    split_token_h = max(1, (h + patch_size - 1) // patch_size)
+    split_token_w = max(1, (w + patch_size - 1) // patch_size)
+
+    # Pad image so it divides evenly into tiles
+    mod_pad_h = (split_token_h - h % split_token_h) % split_token_h
+    mod_pad_w = (split_token_w - w % split_token_w) % split_token_w
+    img = F.pad(img, (0, mod_pad_w, 0, mod_pad_h), mode="reflect")
 
     _, _, H, W = img.size()
     split_h = H // split_token_h
     split_w = W // split_token_w
-    shave_h = split_h // 10
-    shave_w = split_w // 10
+    # Overlap: fixed 8 px minimum, or 10% of tile size
+    shave_h = max(8, split_h // 10)
+    shave_w = max(8, split_w // 10)
 
-    slices = []
+    # Canonical (max) patch dimensions for uniform batching
+    ph_max = split_h + 2 * shave_h
+    pw_max = split_w + 2 * shave_w
+
+    # Collect raw slices and actual patch H/W (edge tiles may be smaller)
+    patches_meta = []  # (top_slice, left_slice, actual_ph, actual_pw)
     for i in range(split_token_h):
         for j in range(split_token_w):
-            top = slice(
-                max(0, i * split_h - shave_h), min(H, (i + 1) * split_h + shave_h)
-            )
-            left = slice(
-                max(0, j * split_w - shave_w), min(W, (j + 1) * split_w + shave_w)
-            )
-            slices.append((top, left))
+            t = max(0, i * split_h - shave_h)
+            b = min(H, (i + 1) * split_h + shave_h)
+            left_ = max(0, j * split_w - shave_w)
+            r = min(W, (j + 1) * split_w + shave_w)
+            patches_meta.append((slice(t, b), slice(left_, r), b - t, r - left_))
 
-    outputs = []
-    for top, left in tqdm(slices, desc="Processing patches", unit="patch"):
-        patch = img[..., top, left]
-        out = model(patch)
-        outputs.append(out)
+    # Extract and pad all patches to uniform size (ph_max, pw_max)
+    all_patches = []
+    for top, left, ph, pw in patches_meta:
+        p = img[..., top, left]  # (1, C, ph, pw)
+        if ph < ph_max or pw < pw_max:
+            p = F.pad(p, (0, pw_max - pw, 0, ph_max - ph), mode="reflect")
+        all_patches.append(p)
 
+    # Batch forward: process batch_size patches at a time
+    n_total = len(all_patches)
+    outputs = []  # each element: (1, C, ph*scale, pw*scale) — already cropped
+    if batch_size == 1:
+        # Fast path: avoid the cat/split overhead for single-patch processing
+        for i, (p, (_, _, ph, pw)) in enumerate(tqdm(
+            zip(all_patches, patches_meta), total=n_total, desc="Processing patches", unit="patch"
+        )):
+            out = model(p)  # (1, C, ph_max*scale, pw_max*scale)
+            outputs.append(out[:, :, : ph * scale, : pw * scale])
+    else:
+        for start in tqdm(range(0, n_total, batch_size), desc="Processing patch batches", unit="batch"):
+            chunk = all_patches[start: start + batch_size]  # list of (1, C, ph_max, pw_max)
+            batch = torch.cat(chunk, dim=0)                  # (B, C, ph_max, pw_max)
+            out = model(batch)                               # (B, C, ph_max*scale, pw_max*scale)
+            # Split back and crop to actual output size
+            for k, (_, _, ph, pw) in enumerate(patches_meta[start: start + batch_size]):
+                outputs.append(out[k: k + 1, :, : ph * scale, : pw * scale])
+
+    # Assemble result
     result = torch.zeros(1, C, H * scale, W * scale, device=img.device)
-    for i in range(split_token_h):
-        for j in range(split_token_w):
-            top = slice(i * split_h * scale, (i + 1) * split_h * scale)
-            left = slice(j * split_w * scale, (j + 1) * split_w * scale)
-            _top = slice(
-                shave_h * scale if i > 0 else 0,
-                (shave_h + split_h) * scale if i > 0 else split_h * scale,
-            )
-            _left = slice(
-                shave_w * scale if j > 0 else 0,
-                (shave_w + split_w) * scale if j > 0 else split_w * scale,
-            )
-            result[..., top, left] = outputs[i * split_token_w + j][..., _top, _left]
+    for idx, (i, j) in enumerate(
+        (i, j) for i in range(split_token_h) for j in range(split_token_w)
+    ):
+        top   = slice(i * split_h * scale, (i + 1) * split_h * scale)
+        left  = slice(j * split_w * scale, (j + 1) * split_w * scale)
+        _top  = slice(
+            shave_h * scale if i > 0 else 0,
+            (shave_h + split_h) * scale if i > 0 else split_h * scale,
+        )
+        _left = slice(
+            shave_w * scale if j > 0 else 0,
+            (shave_w + split_w) * scale if j > 0 else split_w * scale,
+        )
+        result[..., top, left] = outputs[idx][..., _top, _left]
 
-    result = result[
-        :, :, 0 : h * scale - mod_pad_h * scale, 0 : w * scale - mod_pad_w * scale
-    ]
+    # Remove padding
+    result = result[:, :, : h * scale - mod_pad_h * scale, : w * scale - mod_pad_w * scale]
     return result
 
 
 def process_image(
-    image_input_path, image_output_path, model, device, scale, patch_size=0
+    image_input_path, image_output_path, model, device, scale, patch_size=0, batch_size=4
 ):
     with torch.no_grad():
         image_input = Image.open(image_input_path).convert("RGB")
@@ -129,7 +164,7 @@ def process_image(
 
         if patch_size > 0:
             image_output = patchwise_inference(
-                image_input, model, patch_size, scale
+                image_input, model, patch_size, scale, batch_size
             )
             image_output = image_output.clamp(0.0, 1.0)[0].cpu()
         else:
@@ -261,6 +296,7 @@ def main():
                     device,
                     args.scale,
                     args.patch_size,
+                    args.batch_size,
                 )
     else:
         if (
@@ -286,6 +322,7 @@ def main():
                 device,
                 args.scale,
                 args.patch_size,
+                args.batch_size,
             )
 
 
