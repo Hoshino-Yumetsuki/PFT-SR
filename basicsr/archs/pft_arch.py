@@ -20,10 +20,11 @@ class SMM_QmK(Function):
         BH, N, C = A.shape
         topk = index.shape[2]
 
-        B_T = B.transpose(1, 2)
-        index_expanded = index.unsqueeze(-1).expand(BH, N, topk, C)
-        B_T_expanded = B_T.unsqueeze(1).expand(BH, N, N, C)
-        B_selected = torch.gather(B_T_expanded, 2, index_expanded)
+        # Optimized: gather directly along dim=1 on (BH,N,C) to avoid O(N^2) memory expansion
+        B_T = B.transpose(1, 2).contiguous()  # (BH, N, C)
+        index_flat = index.reshape(BH, N * topk)
+        index_flat_exp = index_flat.unsqueeze(-1).expand(BH, N * topk, C)
+        B_selected = torch.gather(B_T, 1, index_flat_exp).view(BH, N, topk, C)
 
         output = torch.einsum("bnc,bnkc->bnk", A, B_selected)
         return output
@@ -48,9 +49,11 @@ class SMM_QmK(Function):
         grad_B_T_selected_flat = grad_B_T_selected.reshape(BH * N, topk, C)
         index_flat = index.reshape(BH * N, topk)
 
-        for i in range(BH * N):
-            for k in range(topk):
-                grad_B_T[i // N, index_flat[i, k], :] += grad_B_T_selected_flat[i, k, :]
+        # Replace Python double-loop with vectorised scatter_add_
+        # grad_B_T[b, index[b,n,k], :] += grad[b,n,k,:]
+        src = grad_B_T_selected_flat.view(BH, N * topk, C)
+        idx = index_flat.view(BH, N * topk, 1).expand(BH, N * topk, C)
+        grad_B_T.scatter_add_(1, idx, src)
 
         grad_B = grad_B_T.transpose(1, 2)
         return grad_A, grad_B, None
@@ -63,9 +66,10 @@ class SMM_AmV(Function):
         BH, N, topk = A.shape[0], A.shape[1], A.shape[2]
         C = B.shape[2]
 
-        index_expanded = index.unsqueeze(-1).expand(BH, N, topk, C)
-        B_expanded = B.unsqueeze(2).expand(BH, N, topk, C)
-        B_selected = torch.gather(B_expanded, 1, index_expanded)
+        # Optimized: gather directly along dim=1 on (BH,N,C) to avoid redundant B expansion
+        index_flat = index.reshape(BH, N * topk)
+        index_flat_exp = index_flat.unsqueeze(-1).expand(BH, N * topk, C)
+        B_selected = torch.gather(B, 1, index_flat_exp).view(BH, N, topk, C)
 
         output = torch.einsum("bnk,bnkc->bnc", A, B_selected)
         return output
@@ -89,6 +93,29 @@ class SMM_AmV(Function):
         grad_B.scatter_add_(1, index_expanded, grad_B_selected)
 
         return grad_A, grad_B, None
+
+
+# ---------------------------------------------------------------------------
+# Inference-only inline helpers — bypass autograd Function overhead and use
+# cuBLAS GEMM via torch.bmm for significantly better GPU utilisation.
+# ---------------------------------------------------------------------------
+
+def _smm_qmk_infer(q: torch.Tensor, k: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
+    """Sparse Q @ K^T for inference.  q,k: (BH,N,C)  index: (BH,N,topk) int64"""
+    BH, N, topk = index.shape
+    C = q.shape[-1]
+    idx = index.reshape(BH, N * topk, 1).expand(BH, N * topk, C)
+    k_sel = torch.gather(k, 1, idx).view(BH * N, topk, C)          # (BH*N, topk, C)
+    return torch.bmm(q.reshape(BH * N, 1, C), k_sel.transpose(1, 2)).view(BH, N, topk)
+
+
+def _smm_amv_infer(attn: torch.Tensor, v: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
+    """Sparse Attn @ V for inference.  attn: (BH,N,topk)  v: (BH,N,C)  index: (BH,N,topk) int64"""
+    BH, N, topk = index.shape
+    C = v.shape[-1]
+    idx = index.reshape(BH, N * topk, 1).expand(BH, N * topk, C)
+    v_sel = torch.gather(v, 1, idx).view(BH * N, topk, C)          # (BH*N, topk, C)
+    return torch.bmm(attn.reshape(BH * N, 1, topk), v_sel).view(BH, N, C)
 
 
 class dwconv(nn.Module):
@@ -223,6 +250,9 @@ class WindowAttention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.softmax = nn.Softmax(dim=-1)
         self.topk = self.num_topk[self.layer_id]
+        # Cached dense RPB (1, nH_or_1, N, N). Populated on first eval-mode
+        # forward and reused to avoid repeated table-lookup + reshape.
+        self._rpb_cache: torch.Tensor | None = None
 
     def forward(self, qkvp, pfa_values, pfa_indices, rpi, mask=None, shift=0):
         r"""
@@ -236,92 +266,67 @@ class WindowAttention(nn.Module):
         """
         b_, n, c4 = qkvp.shape
         c = c4 // 4
-        qkvp = qkvp.reshape(b_, n, 4, self.num_heads, c // self.num_heads).permute(
-            2, 0, 3, 1, 4
-        )
-        q, k, v, v_lepe = (
-            qkvp[0],
-            qkvp[1],
-            qkvp[2],
-            qkvp[3],
-        )  # make torchscript happy (cannot use tensor as tuple)
+        nH = self.num_heads
+        hC = c // nH
+
+        qkvp = qkvp.reshape(b_, n, 4, nH, hC).permute(2, 0, 3, 1, 4)
+        q, k, v, v_lepe = qkvp[0], qkvp[1], qkvp[2], qkvp[3]
 
         q = q * self.scale
-        # Standard Attention Computation
-        if pfa_indices[shift] is None:
-            attn = q @ k.transpose(-2, -1)  # b_, self.num_heads, n, n
-            relative_position_bias = self.relative_position_bias_table[
-                rpi.view(-1)
-            ].view(
+
+        # ------------------------------------------------------------------
+        # Relative Position Bias — compute once and cache in eval mode.
+        # Shape: (1, nH_or_1, N, N)  broadcasts over the batch dimension.
+        # ------------------------------------------------------------------
+        if not self.training and self._rpb_cache is not None:
+            rpb = self._rpb_cache
+        else:
+            rpb = self.relative_position_bias_table[rpi.view(-1)].view(
                 self.window_size[0] * self.window_size[1],
                 self.window_size[0] * self.window_size[1],
                 -1,
-            )  # Wh*Ww,Wh*Ww,nH
-            relative_position_bias = (
-                relative_position_bias.permute(2, 0, 1).contiguous().unsqueeze(0)
-            )  # nH, Wh*Ww, Wh*Ww
-            if not self.training:  # Check if in inference mode
-                attn.add_(relative_position_bias)  # only in inference
-            else:
-                attn = attn + relative_position_bias  # Non-inplace if training
+            )  # (N, N, nH_or_1)
+            rpb = rpb.permute(2, 0, 1).unsqueeze(0).contiguous()  # (1, nH_or_1, N, N)
+            if not self.training:
+                self._rpb_cache = rpb
 
+        # Standard Attention
+        if pfa_indices[shift] is None:
+            attn = q @ k.transpose(-2, -1)  # (b_, nH, n, n)
+            attn = attn + rpb
             if shift and mask is not None:
                 nw = mask.shape[0]
-                attn = attn.view(b_ // nw, nw, self.num_heads, n, n) + mask.unsqueeze(
-                    1
-                ).unsqueeze(0)
-                attn = attn.view(-1, self.num_heads, n, n)
-        # # Sparse Attention Computation using SMM_QmK
+                attn = attn.view(b_ // nw, nw, nH, n, n) + mask.unsqueeze(1).unsqueeze(0)
+                attn = attn.view(-1, nH, n, n)
+        # Sparse Attention
         else:
-            topk = pfa_indices[shift].shape[-1]
-            q = q.contiguous().view(b_ * self.num_heads, n, c // self.num_heads)
-            k = (
-                k.contiguous()
-                .view(b_ * self.num_heads, n, c // self.num_heads)
-                .transpose(-2, -1)
-            )
-            smm_index = pfa_indices[shift].view(b_ * self.num_heads, n, topk).int()
-            attn = SMM_QmK.apply(q, k, smm_index).view(b_, self.num_heads, n, topk)
+            topk_k = pfa_indices[shift].shape[-1]
+            q_flat = q.contiguous().view(b_ * nH, n, hC)
+            k_flat = k.contiguous().view(b_ * nH, n, hC)
+            # Keep indices as int64 — avoids redundant INT32↔INT64 conversions.
+            idx = pfa_indices[shift].view(b_ * nH, n, topk_k)
 
-            relative_position_bias = self.relative_position_bias_table[
-                rpi.view(-1)
-            ].view(
-                self.window_size[0] * self.window_size[1],
-                self.window_size[0] * self.window_size[1],
-                -1,
-            )  # Wh*Ww,Wh*Ww,nH
-            relative_position_bias = (
-                relative_position_bias.permute(2, 0, 1)
-                .contiguous()
-                .unsqueeze(0)
-                .expand(b_, self.num_heads, n, n)
-            )  # nH, Wh*Ww, Wh*Ww
-            relative_position_bias = torch.gather(
-                relative_position_bias, dim=-1, index=pfa_indices[shift]
-            )
-            if not self.training:  # Check if in inference mode
-                attn.add_(relative_position_bias)  # only in inference
+            if self.training:
+                attn = SMM_QmK.apply(q_flat, k_flat, idx.int()).view(b_, nH, n, topk_k)
             else:
-                attn = attn + relative_position_bias  # Non-inplace if training
+                attn = _smm_qmk_infer(q_flat, k_flat, idx).view(b_, nH, n, topk_k)
 
-        # Use in-place operations where possible (only in inference mode)
-        if not self.training:  # Check if in inference mode
-            attn = torch.softmax(attn, dim=-1, out=attn)  # 原地softmax
-        else:
-            attn = self.softmax(attn)  # Non-inplace if training
+            # Gather sparse RPB: rpb.expand() is zero-copy; only the gather
+            # output (b_, nH, n, topk_k) is materialised — avoids O(N²) alloc.
+            rpb_sparse = torch.gather(
+                rpb.expand(b_, -1, n, n), dim=-1, index=pfa_indices[shift]
+            )  # (b_, nH, n, topk_k)
+            attn = attn + rpb_sparse
 
-        # Apply Hadamard product for PFA and normalize.
+        # Softmax
+        attn = torch.softmax(attn, dim=-1)
+
+        # Apply Hadamard product for PFA and normalise.
         if pfa_values[shift] is not None:
-            if not self.training:  # only in inference
-                attn.mul_(pfa_values[shift])
-                attn.add_(self.eps)
-                denom = attn.sum(dim=-1, keepdim=True).add_(self.eps)
-                attn.div_(denom)
-            else:
-                attn = attn * pfa_values[shift]
-                attn = (attn + self.eps) / (attn.sum(dim=-1, keepdim=True) + self.eps)
+            attn = attn * pfa_values[shift]
+            attn = (attn + self.eps) / (attn.sum(dim=-1, keepdim=True) + self.eps)
 
-        # If sparsification is enabled, select top-k attention values and save the corresponding indexes
+        # Top-k sparsification
         if self.topk < self.window_size[0] * self.window_size[1]:
             topk_values, topk_indices = torch.topk(
                 attn, self.topk, dim=-1, largest=True, sorted=False
@@ -334,46 +339,24 @@ class WindowAttention(nn.Module):
             else:
                 pfa_indices[shift] = topk_indices
 
-        # Save the current attention results as PFA maps.
+        # Save current attention as PFA maps.
         pfa_values[shift] = attn
 
-        # # Save the attention map as a .npy file for visualization or further analysis
-        # # Scatter the attention values back to their original indices
-        # # attn_npy has shape (batch_size * num_windows, num_heads, n, n)
-        # if pfa_indices[shift] is None:
-        #     attn_npy = attn
-        # else:
-        #     attn_npy = torch.zeros((b_, self.num_heads, n, n), device=attn.device).scatter(-1, pfa_indices[shift], attn)
-        # # Define the path where the attention map will be saved
-        # attention_save_path = f"./results/Attention_map/PFT_light_attention_map_w32_L{self.layer_id}.npy"
-        # os.makedirs("./results/Attention_map", exist_ok=True)
-        # # Save the attention map only if the file does not already exist to avoid overwriting
-        # if not os.path.exists(attention_save_path):
-        #     np.save(attention_save_path, attn_npy.cpu().detach().numpy())
-
-        # Check whether sparsification has been applied; if so, use SMM_AmV for computation, otherwise perform standard matrix multiplication A @ V.
+        # Attn @ V
         if pfa_indices[shift] is None:
             x = ((attn @ v) + v_lepe).transpose(1, 2).reshape(b_, n, c)
         else:
-            topk = pfa_indices[shift].shape[-1]
-            attn = attn.view(b_ * self.num_heads, n, topk)
-            v = v.contiguous().view(b_ * self.num_heads, n, c // self.num_heads)
-            smm_index = pfa_indices[shift].view(b_ * self.num_heads, n, topk).int()
-            x = (
-                (
-                    SMM_AmV.apply(attn, v, smm_index).view(
-                        b_, self.num_heads, n, c // self.num_heads
-                    )
-                    + v_lepe
-                )
-                .transpose(1, 2)
-                .reshape(b_, n, c)
-            )
+            topk_v = pfa_indices[shift].shape[-1]
+            attn_flat = attn.view(b_ * nH, n, topk_v)
+            v_flat = v.contiguous().view(b_ * nH, n, hC)
+            idx_v = pfa_indices[shift].view(b_ * nH, n, topk_v)  # int64
 
-        # only in inference. After use, delete unnecessary variables to free memory
-        if not self.training:
-            del q, k, v, relative_position_bias
-            torch.cuda.empty_cache()  # Clear the unused cache
+            if self.training:
+                out = SMM_AmV.apply(attn_flat, v_flat, idx_v.int()).view(b_, nH, n, hC)
+            else:
+                out = _smm_amv_infer(attn_flat, v_flat, idx_v).view(b_, nH, n, hC)
+
+            x = (out + v_lepe).transpose(1, 2).reshape(b_, n, c)
 
         x = self.proj(x)
         return x, pfa_values, pfa_indices
@@ -1182,6 +1165,9 @@ class PFT(nn.Module):
             self.conv_last = nn.Conv2d(embed_dim, num_out_ch, 3, 1, 1)
 
         self.apply(self._init_weights)
+        # Per-size attention mask cache: avoids re-computing the CPU mask
+        # and GPU transfer on every forward call for same-size inputs.
+        self._mask_cache: dict = {}
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -1238,35 +1224,30 @@ class PFT(nn.Module):
         relative_position_index = relative_coords.sum(-1)  # Wh*Ww, Wh*Ww
         return relative_position_index
 
-    def calculate_mask(self, x_size):
-        # calculate attention mask for SW-MSA
+    def calculate_mask(self, x_size, device=None):
+        # calculate attention mask for SW-MSA — fully vectorised, runs on target device
         h, w = x_size
-        img_mask = torch.zeros((1, h, w, 1))  # 1 h w 1
-        h_slices = (
-            slice(0, -self.window_size),
-            slice(-self.window_size, -(self.window_size // 2)),
-            slice(-(self.window_size // 2), None),
-        )
-        w_slices = (
-            slice(0, -self.window_size),
-            slice(-self.window_size, -(self.window_size // 2)),
-            slice(-(self.window_size // 2), None),
-        )
-        cnt = 0
-        for h in h_slices:
-            for w in w_slices:
-                img_mask[:, h, w, :] = cnt
-                cnt += 1
+        ws = self.window_size
+        hs = ws // 2
 
-        mask_windows = window_partition(
-            img_mask, self.window_size
-        )  # nw, window_size, window_size, 1
-        mask_windows = mask_windows.view(-1, self.window_size * self.window_size)
+        # Assign each row/col a region index (0/1/2) based on cyclic-shift boundaries
+        h_region = torch.zeros(h, dtype=torch.long, device=device)
+        h_region[h - ws: h - hs] = 1
+        h_region[h - hs:] = 2
+
+        w_region = torch.zeros(w, dtype=torch.long, device=device)
+        w_region[w - ws: w - hs] = 1
+        w_region[w - hs:] = 2
+
+        # Combined region id in [0, 8], shape (h, w) -> (1, h, w, 1)
+        img_mask = (h_region.unsqueeze(1) * 3 + w_region.unsqueeze(0)).float().view(1, h, w, 1)
+
+        mask_windows = window_partition(img_mask, ws)  # nw, ws, ws, 1
+        mask_windows = mask_windows.view(-1, ws * ws)
         attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
         attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(
             attn_mask == 0, float(0.0)
         )
-
         return attn_mask
 
     def forward(self, x):
@@ -1275,13 +1256,21 @@ class PFT(nn.Module):
         h_pad = ((h_ori + mod - 1) // mod) * mod - h_ori
         w_pad = ((w_ori + mod - 1) // mod) * mod - w_ori
         h, w = h_ori + h_pad, w_ori + w_pad
-        x = torch.cat([x, torch.flip(x, [2])], 2)[:, :, :h, :]
-        x = torch.cat([x, torch.flip(x, [3])], 3)[:, :, :, :w]
+        # Use symmetric (include-boundary) padding to match training behaviour.
+        # F.pad "reflect" excludes the boundary pixel, so we replicate manually:
+        # flip and concat along each spatial dim, then slice to target size.
+        if h_pad > 0:
+            x = torch.cat([x, x.flip(2)], 2)[:, :, :h, :]
+        if w_pad > 0:
+            x = torch.cat([x, x.flip(3)], 3)[:, :, :, :w]
 
         self.mean = self.mean.type_as(x)
         x = (x - self.mean) * self.img_range
 
-        attn_mask = self.calculate_mask([h, w]).to(x.device)
+        mask_key = (h, w)
+        if mask_key not in self._mask_cache:
+            self._mask_cache[mask_key] = self.calculate_mask([h, w], device=x.device)
+        attn_mask = self._mask_cache[mask_key]
         params = {"attn_mask": attn_mask, "rpi_sa": self.relative_position_index_SA}
 
         if self.upsampler == "pixelshuffle":
