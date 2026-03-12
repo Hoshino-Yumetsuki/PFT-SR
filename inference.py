@@ -60,7 +60,7 @@ def get_parser(**parser_kwargs):
         type=int,
         default=128,
         help="Patch size for patchwise inference. Larger = fewer patches = faster overall (less kernel launch overhead). "
-             "Use 0 to disable. Rule of thumb for 8 GB VRAM: 256 (safe), 384 (faster), 512 (may OOM on dense-attention layers).",
+        "Use 0 to disable. Rule of thumb for 8 GB VRAM: 256 (safe), 384 (faster), 512 (may OOM on dense-attention layers).",
     )
     parser.add_argument(
         "--batch-size",
@@ -119,28 +119,41 @@ def patchwise_inference(img, model, patch_size, scale, batch_size=4):
     outputs = []  # each element: (1, C, ph*scale, pw*scale) — already cropped
     if batch_size == 1:
         # Fast path: avoid the cat/split overhead for single-patch processing
-        for i, (p, (_, _, ph, pw)) in enumerate(tqdm(
-            zip(all_patches, patches_meta), total=n_total, desc="Processing patches", unit="patch"
-        )):
+        for i, (p, (_, _, ph, pw)) in enumerate(
+            tqdm(
+                zip(all_patches, patches_meta),
+                total=n_total,
+                desc="Processing patches",
+                unit="patch",
+            )
+        ):
             out = model(p)  # (1, C, ph_max*scale, pw_max*scale)
             outputs.append(out[:, :, : ph * scale, : pw * scale])
     else:
-        for start in tqdm(range(0, n_total, batch_size), desc="Processing patch batches", unit="batch"):
-            chunk = all_patches[start: start + batch_size]  # list of (1, C, ph_max, pw_max)
-            batch = torch.cat(chunk, dim=0)                  # (B, C, ph_max, pw_max)
-            out = model(batch)                               # (B, C, ph_max*scale, pw_max*scale)
+        for start in tqdm(
+            range(0, n_total, batch_size), desc="Processing patch batches", unit="batch"
+        ):
+            chunk = all_patches[
+                start : start + batch_size
+            ]  # list of (1, C, ph_max, pw_max)
+            batch = torch.cat(chunk, dim=0)  # (B, C, ph_max, pw_max)
+            out = model(batch)  # (B, C, ph_max*scale, pw_max*scale)
             # Split back and crop to actual output size
-            for k, (_, _, ph, pw) in enumerate(patches_meta[start: start + batch_size]):
-                outputs.append(out[k: k + 1, :, : ph * scale, : pw * scale])
+            for k, (_, _, ph, pw) in enumerate(
+                patches_meta[start : start + batch_size]
+            ):
+                outputs.append(out[k : k + 1, :, : ph * scale, : pw * scale])
 
-    # Assemble result
-    result = torch.zeros(1, C, H * scale, W * scale, device=img.device)
+    # Assemble result (match dtype of model outputs for efficiency)
+    result = torch.zeros(
+        1, C, H * scale, W * scale, device=img.device, dtype=outputs[0].dtype
+    )
     for idx, (i, j) in enumerate(
         (i, j) for i in range(split_token_h) for j in range(split_token_w)
     ):
-        top   = slice(i * split_h * scale, (i + 1) * split_h * scale)
-        left  = slice(j * split_w * scale, (j + 1) * split_w * scale)
-        _top  = slice(
+        top = slice(i * split_h * scale, (i + 1) * split_h * scale)
+        left = slice(j * split_w * scale, (j + 1) * split_w * scale)
+        _top = slice(
             shave_h * scale if i > 0 else 0,
             (shave_h + split_h) * scale if i > 0 else split_h * scale,
         )
@@ -151,25 +164,53 @@ def patchwise_inference(img, model, patch_size, scale, batch_size=4):
         result[..., top, left] = outputs[idx][..., _top, _left]
 
     # Remove padding
-    result = result[:, :, : h * scale - mod_pad_h * scale, : w * scale - mod_pad_w * scale]
+    result = result[
+        :, :, : h * scale - mod_pad_h * scale, : w * scale - mod_pad_w * scale
+    ]
     return result
 
 
 def process_image(
-    image_input_path, image_output_path, model, device, scale, patch_size=0, batch_size=4
+    image_input_path,
+    image_output_path,
+    model,
+    device,
+    scale,
+    patch_size=0,
+    batch_size=4,
 ):
     with torch.no_grad():
         image_input = Image.open(image_input_path).convert("RGB")
         image_input = transforms.ToTensor()(image_input).unsqueeze(0).to(device)
 
+        # Match input dtype to model dtype (fp16/fp32)
+        model_dtype = next(model.parameters()).dtype
+        image_input = image_input.to(dtype=model_dtype)
+
         if patch_size > 0:
             image_output = patchwise_inference(
                 image_input, model, patch_size, scale, batch_size
             )
-            image_output = image_output.clamp(0.0, 1.0)[0].cpu()
         else:
-            image_output = model(image_input).clamp(0.0, 1.0)[0].cpu()
+            image_output = model(image_input)
 
+        # Debug: Check for NaN/Inf before processing
+        if torch.isnan(image_output).any() or torch.isinf(image_output).any():
+            print(f"WARNING: Output contains NaN or Inf values!")
+            print(f"  NaN count: {torch.isnan(image_output).sum().item()}")
+            print(f"  Inf count: {torch.isinf(image_output).sum().item()}")
+            print(
+                f"  Min: {image_output[~torch.isnan(image_output) & ~torch.isinf(image_output)].min().item() if (~torch.isnan(image_output) & ~torch.isinf(image_output)).any() else 'N/A'}"
+            )
+            print(
+                f"  Max: {image_output[~torch.isnan(image_output) & ~torch.isinf(image_output)].max().item() if (~torch.isnan(image_output) & ~torch.isinf(image_output)).any() else 'N/A'}"
+            )
+        else:
+            print(
+                f"Output stats - Min: {image_output.min().item():.6f}, Max: {image_output.max().item():.6f}, Mean: {image_output.mean().item():.6f}"
+            )
+
+        image_output = image_output.clamp(0.0, 1.0)[0].cpu().float()
         image_output = transforms.ToPILImage()(image_output)
         image_output.save(image_output_path)
 
