@@ -1,9 +1,9 @@
 import collections.abc
 import math
 import torch
-import torchvision
+# simport torchvision
 import warnings
-from distutils.version import LooseVersion
+# from distutils.version import LooseVersion
 from itertools import repeat
 from torch import nn as nn
 from torch.nn import functional as F
@@ -11,7 +11,7 @@ from torch.nn import init as init
 from torch.nn.modules.batchnorm import _BatchNorm
 
 # from basicsr.ops.dcn import ModulatedDeformConvPack, modulated_deform_conv
-from basicsr.utils import get_root_logger
+# from basicsr.utils import get_root_logger
 
 
 @torch.no_grad()

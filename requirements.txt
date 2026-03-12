@@ -9,8 +9,8 @@ pyyaml
 requests
 scikit-image
 scipy
-tb-nightly
-torch==2.5.0
+tensorboard
+torch
 torchvision
 tqdm
 yapf

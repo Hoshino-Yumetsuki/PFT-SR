@@ -1,159 +1,133 @@
-'''
+"""
 An official Pytorch impl of `Progressive Focused Transformer for Single Image Super-Resolution`.
 
 Arxiv: 'https://arxiv.org/abs/2503.20337'
-'''
+"""
 
 import math
-import os
-import numpy as np
 import torch
 import torch.nn as nn
-import torch.utils.checkpoint as checkpoint
-import torch.nn.functional as F
 from basicsr.archs.arch_util import to_2tuple, trunc_normal_
-from fairscale.nn import checkpoint_wrapper
 from basicsr.utils.registry import ARCH_REGISTRY
 from torch.autograd import Function
 from torch.autograd.function import once_differentiable
-import smm_cuda
 
 
 class SMM_QmK(Function):
-    """
-    A custom PyTorch autograd Function for sparse matrix multiplication (SMM) of
-    query (Q) and key (K) matrices, based on given sparse indices.
-
-    This function leverages a CUDA-implemented kernel for efficient computation.
-
-    Forward computation:
-        Computes the sparse matrix multiplication using a custom CUDA function.
-
-    Backward computation:
-        Computes the gradients of A and B using a CUDA-implemented backward function.
-    """
-
     @staticmethod
     def forward(ctx, A, B, index):
-        """
-        Forward function for Sparse Matrix Multiplication QmK.
-
-        Args:
-            ctx: Autograd context to save tensors for backward computation.
-            A: Input tensor A (Query matrix).
-            B: Input tensor B (Key matrix).
-            index: Index tensor specifying the sparse multiplication positions.
-
-        Returns:
-            Tensor: Result of the sparse matrix multiplication.
-        """
-        # Save input tensors for backward computation
         ctx.save_for_backward(A, B, index)
+        BH, N, C = A.shape
+        topk = index.shape[2]
 
-        # Call the custom CUDA forward function for sparse matrix multiplication
-        return smm_cuda.SMM_QmK_forward_cuda(A.contiguous(), B.contiguous(), index.contiguous())
+        B_T = B.transpose(1, 2)
+        index_expanded = index.unsqueeze(-1).expand(BH, N, topk, C)
+        B_T_expanded = B_T.unsqueeze(1).expand(BH, N, N, C)
+        B_selected = torch.gather(B_T_expanded, 2, index_expanded)
+
+        output = torch.einsum("bnc,bnkc->bnk", A, B_selected)
+        return output
 
     @staticmethod
     @once_differentiable
-    def backward(ctx, grad_output):
-        """
-        Backward function for Sparse Matrix Multiplication QmK.
-
-        Args:
-            ctx: Autograd context to retrieve saved tensors.
-            grad_output: Gradient of the output from the forward pass.
-
-        Returns:
-            Tuple: Gradients of the inputs A and B, with None for the index as it is not trainable.
-        """
-        # Retrieve saved tensors from the forward pass
+    def backward(ctx, *grad_outputs):
+        grad_output = grad_outputs[0]
         A, B, index = ctx.saved_tensors
+        BH, N, C = A.shape
+        topk = index.shape[2]
 
-        # Compute gradients using the custom CUDA backward function
-        grad_A, grad_B = smm_cuda.SMM_QmK_backward_cuda(
-            grad_output.contiguous(), A.contiguous(), B.contiguous(), index.contiguous()
-        )
+        B_T = B.transpose(1, 2)
+        index_expanded = index.unsqueeze(-1).expand(BH, N, topk, C)
+        B_T_expanded = B_T.unsqueeze(1).expand(BH, N, N, C)
+        B_selected = torch.gather(B_T_expanded, 2, index_expanded)
 
-        # Return gradients for A and B, no gradient for index
+        grad_A = torch.einsum("bnk,bnkc->bnc", grad_output, B_selected)
+        grad_B_T_selected = torch.einsum("bnk,bnc->bnkc", grad_output, A)
+
+        grad_B_T = torch.zeros(BH, N, C, device=B.device, dtype=B.dtype)
+        grad_B_T_selected_flat = grad_B_T_selected.reshape(BH * N, topk, C)
+        index_flat = index.reshape(BH * N, topk)
+
+        for i in range(BH * N):
+            for k in range(topk):
+                grad_B_T[i // N, index_flat[i, k], :] += grad_B_T_selected_flat[i, k, :]
+
+        grad_B = grad_B_T.transpose(1, 2)
         return grad_A, grad_B, None
+
 
 class SMM_AmV(Function):
-    """
-    A custom PyTorch autograd Function for sparse matrix multiplication (SMM)
-    between an activation matrix (A) and a value matrix (V), guided by sparse indices.
-
-    This function utilizes a CUDA-optimized implementation for efficient computation.
-
-    Forward computation:
-        Computes the sparse matrix multiplication using a custom CUDA function.
-
-    Backward computation:
-        Computes the gradients of A and B using a CUDA-implemented backward function.
-    """
-
     @staticmethod
     def forward(ctx, A, B, index):
-        """
-        Forward function for Sparse Matrix Multiplication AmV.
-
-        Args:
-            ctx: Autograd context to save tensors for backward computation.
-            A: Input tensor A (Activation matrix).
-            B: Input tensor B (Value matrix).
-            index: Index tensor specifying the sparse multiplication positions.
-
-        Returns:
-            Tensor: Result of the sparse matrix multiplication.
-        """
-        # Save tensors for backward computation
         ctx.save_for_backward(A, B, index)
+        BH, N, topk = A.shape[0], A.shape[1], A.shape[2]
+        C = B.shape[2]
 
-        # Call the custom CUDA forward function
-        return smm_cuda.SMM_AmV_forward_cuda(A.contiguous(), B.contiguous(), index.contiguous())
+        index_expanded = index.unsqueeze(-1).expand(BH, N, topk, C)
+        B_expanded = B.unsqueeze(2).expand(BH, N, topk, C)
+        B_selected = torch.gather(B_expanded, 1, index_expanded)
+
+        output = torch.einsum("bnk,bnkc->bnc", A, B_selected)
+        return output
 
     @staticmethod
     @once_differentiable
-    def backward(ctx, grad_output):
-        """
-        Backward function for Sparse Matrix Multiplication AmV.
-
-        Args:
-            ctx: Autograd context to retrieve saved tensors.
-            grad_output: Gradient of the output from the forward pass.
-
-        Returns:
-            Tuple: Gradients of the inputs A and B, with None for the index as it is not trainable.
-        """
-        # Retrieve saved tensors from the forward pass
+    def backward(ctx, *grad_outputs):
+        grad_output = grad_outputs[0]
         A, B, index = ctx.saved_tensors
+        BH, N, topk = A.shape[0], A.shape[1], A.shape[2]
+        C = B.shape[2]
 
-        # Compute gradients using the custom CUDA backward function
-        grad_A, grad_B = smm_cuda.SMM_AmV_backward_cuda(
-            grad_output.contiguous(), A.contiguous(), B.contiguous(), index.contiguous()
-        )
+        index_expanded = index.unsqueeze(-1).expand(BH, N, topk, C)
+        B_expanded = B.unsqueeze(2).expand(BH, N, topk, C)
+        B_selected = torch.gather(B_expanded, 1, index_expanded)
 
-        # Return gradients for A and B, no gradient for index
+        grad_A = torch.einsum("bnc,bnkc->bnk", grad_output, B_selected)
+        grad_B_selected = torch.einsum("bnk,bnc->bnkc", A, grad_output)
+
+        grad_B = torch.zeros_like(B)
+        grad_B.scatter_add_(1, index_expanded, grad_B_selected)
+
         return grad_A, grad_B, None
-
 
 
 class dwconv(nn.Module):
     def __init__(self, hidden_features, kernel_size=5):
         super(dwconv, self).__init__()
         self.depthwise_conv = nn.Sequential(
-            nn.Conv2d(hidden_features, hidden_features, kernel_size=kernel_size, stride=1,
-                      padding=(kernel_size - 1) // 2, dilation=1,
-                      groups=hidden_features), nn.GELU())
+            nn.Conv2d(
+                hidden_features,
+                hidden_features,
+                kernel_size=kernel_size,
+                stride=1,
+                padding=(kernel_size - 1) // 2,
+                dilation=1,
+                groups=hidden_features,
+            ),
+            nn.GELU(),
+        )
         self.hidden_features = hidden_features
 
     def forward(self, x, x_size):
-        x = x.transpose(1, 2).view(x.shape[0], self.hidden_features, x_size[0], x_size[1]).contiguous()  # b Ph*Pw c
+        x = (
+            x.transpose(1, 2)
+            .view(x.shape[0], self.hidden_features, x_size[0], x_size[1])
+            .contiguous()
+        )  # b Ph*Pw c
         x = self.depthwise_conv(x)
         x = x.flatten(2).transpose(1, 2).contiguous()
         return x
 
+
 class ConvFFN(nn.Module):
-    def __init__(self, in_features, hidden_features=None, out_features=None, kernel_size=5, act_layer=nn.GELU):
+    def __init__(
+        self,
+        in_features,
+        hidden_features=None,
+        out_features=None,
+        kernel_size=5,
+        act_layer=nn.GELU,
+    ):
         super().__init__()
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
@@ -169,6 +143,7 @@ class ConvFFN(nn.Module):
         x = self.fc2(x)
         return x
 
+
 def window_partition(x, window_size):
     """
     Args:
@@ -180,8 +155,11 @@ def window_partition(x, window_size):
     """
     b, h, w, c = x.shape
     x = x.view(b, h // window_size, window_size, w // window_size, window_size, c)
-    windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, c)
+    windows = (
+        x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, c)
+    )
     return windows
+
 
 def window_reverse(windows, window_size, h, w):
     """
@@ -195,9 +173,12 @@ def window_reverse(windows, window_size, h, w):
         x: (b, h, w, c)
     """
     b = int(windows.shape[0] / (h * w / window_size / window_size))
-    x = windows.view(b, h // window_size, w // window_size, window_size, window_size, -1)
+    x = windows.view(
+        b, h // window_size, w // window_size, window_size, window_size, -1
+    )
     x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(b, h, w, -1)
     return x
+
 
 class WindowAttention(nn.Module):
     r"""
@@ -221,17 +202,23 @@ class WindowAttention(nn.Module):
         self.num_topk = num_topk
         self.qkv_bias = qkv_bias
         head_dim = dim // num_heads
-        self.scale = head_dim ** -0.5
+        self.scale = head_dim**-0.5
         self.eps = 1e-20
 
         # define a parameter table of relative position bias
         if dim > 100:
             # for classical SR
-            self.relative_position_bias_table = nn.Parameter(torch.zeros((2 * window_size[0] - 1) * (2 * window_size[1] - 1), self.num_heads))  # 2*Wh-1 * 2*Ww-1, nH
+            self.relative_position_bias_table = nn.Parameter(
+                torch.zeros(
+                    (2 * window_size[0] - 1) * (2 * window_size[1] - 1), self.num_heads
+                )
+            )  # 2*Wh-1 * 2*Ww-1, nH
         else:
             # for lightweight SR
-            self.relative_position_bias_table = nn.Parameter(torch.zeros((2 * window_size[0] - 1) * (2 * window_size[1] - 1), 1))  # 2*Wh-1 * 2*Ww-1, nH
-        trunc_normal_(self.relative_position_bias_table, std=.02)
+            self.relative_position_bias_table = nn.Parameter(
+                torch.zeros((2 * window_size[0] - 1) * (2 * window_size[1] - 1), 1)
+            )  # 2*Wh-1 * 2*Ww-1, nH
+        trunc_normal_(self.relative_position_bias_table, std=0.02)
 
         self.proj = nn.Linear(dim, dim)
         self.softmax = nn.Softmax(dim=-1)
@@ -249,35 +236,69 @@ class WindowAttention(nn.Module):
         """
         b_, n, c4 = qkvp.shape
         c = c4 // 4
-        qkvp = qkvp.reshape(b_, n, 4, self.num_heads, c // self.num_heads).permute(2, 0, 3, 1, 4)
-        q, k, v, v_lepe = qkvp[0], qkvp[1], qkvp[2], qkvp[3]  # make torchscript happy (cannot use tensor as tuple)
+        qkvp = qkvp.reshape(b_, n, 4, self.num_heads, c // self.num_heads).permute(
+            2, 0, 3, 1, 4
+        )
+        q, k, v, v_lepe = (
+            qkvp[0],
+            qkvp[1],
+            qkvp[2],
+            qkvp[3],
+        )  # make torchscript happy (cannot use tensor as tuple)
 
         q = q * self.scale
         # Standard Attention Computation
         if pfa_indices[shift] is None:
-            attn = (q @ k.transpose(-2, -1))  # b_, self.num_heads, n, n
-            relative_position_bias = self.relative_position_bias_table[rpi.view(-1)].view(self.window_size[0] * self.window_size[1], self.window_size[0] * self.window_size[1], -1)  # Wh*Ww,Wh*Ww,nH
-            relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous().unsqueeze(0)  # nH, Wh*Ww, Wh*Ww
+            attn = q @ k.transpose(-2, -1)  # b_, self.num_heads, n, n
+            relative_position_bias = self.relative_position_bias_table[
+                rpi.view(-1)
+            ].view(
+                self.window_size[0] * self.window_size[1],
+                self.window_size[0] * self.window_size[1],
+                -1,
+            )  # Wh*Ww,Wh*Ww,nH
+            relative_position_bias = (
+                relative_position_bias.permute(2, 0, 1).contiguous().unsqueeze(0)
+            )  # nH, Wh*Ww, Wh*Ww
             if not self.training:  # Check if in inference mode
                 attn.add_(relative_position_bias)  # only in inference
             else:
                 attn = attn + relative_position_bias  # Non-inplace if training
 
-            if shift:
+            if shift and mask is not None:
                 nw = mask.shape[0]
-                attn = attn.view(b_ // nw, nw, self.num_heads, n, n) + mask.unsqueeze(1).unsqueeze(0)
+                attn = attn.view(b_ // nw, nw, self.num_heads, n, n) + mask.unsqueeze(
+                    1
+                ).unsqueeze(0)
                 attn = attn.view(-1, self.num_heads, n, n)
         # # Sparse Attention Computation using SMM_QmK
         else:
             topk = pfa_indices[shift].shape[-1]
             q = q.contiguous().view(b_ * self.num_heads, n, c // self.num_heads)
-            k = k.contiguous().view(b_ * self.num_heads, n, c // self.num_heads).transpose(-2, -1)
+            k = (
+                k.contiguous()
+                .view(b_ * self.num_heads, n, c // self.num_heads)
+                .transpose(-2, -1)
+            )
             smm_index = pfa_indices[shift].view(b_ * self.num_heads, n, topk).int()
             attn = SMM_QmK.apply(q, k, smm_index).view(b_, self.num_heads, n, topk)
 
-            relative_position_bias = self.relative_position_bias_table[rpi.view(-1)].view(self.window_size[0] * self.window_size[1], self.window_size[0] * self.window_size[1], -1)  # Wh*Ww,Wh*Ww,nH
-            relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous().unsqueeze(0).expand(b_, self.num_heads, n, n)  # nH, Wh*Ww, Wh*Ww
-            relative_position_bias = torch.gather(relative_position_bias, dim=-1, index=pfa_indices[shift])
+            relative_position_bias = self.relative_position_bias_table[
+                rpi.view(-1)
+            ].view(
+                self.window_size[0] * self.window_size[1],
+                self.window_size[0] * self.window_size[1],
+                -1,
+            )  # Wh*Ww,Wh*Ww,nH
+            relative_position_bias = (
+                relative_position_bias.permute(2, 0, 1)
+                .contiguous()
+                .unsqueeze(0)
+                .expand(b_, self.num_heads, n, n)
+            )  # nH, Wh*Ww, Wh*Ww
+            relative_position_bias = torch.gather(
+                relative_position_bias, dim=-1, index=pfa_indices[shift]
+            )
             if not self.training:  # Check if in inference mode
                 attn.add_(relative_position_bias)  # only in inference
             else:
@@ -289,24 +310,27 @@ class WindowAttention(nn.Module):
         else:
             attn = self.softmax(attn)  # Non-inplace if training
 
-
         # Apply Hadamard product for PFA and normalize.
         if pfa_values[shift] is not None:
-            if not self.training: # only in inference
+            if not self.training:  # only in inference
                 attn.mul_(pfa_values[shift])
                 attn.add_(self.eps)
                 denom = attn.sum(dim=-1, keepdim=True).add_(self.eps)
                 attn.div_(denom)
             else:
-                attn = (attn * pfa_values[shift])
+                attn = attn * pfa_values[shift]
                 attn = (attn + self.eps) / (attn.sum(dim=-1, keepdim=True) + self.eps)
 
         # If sparsification is enabled, select top-k attention values and save the corresponding indexes
         if self.topk < self.window_size[0] * self.window_size[1]:
-            topk_values, topk_indices = torch.topk(attn, self.topk, dim=-1, largest=True, sorted=False)
+            topk_values, topk_indices = torch.topk(
+                attn, self.topk, dim=-1, largest=True, sorted=False
+            )
             attn = topk_values
             if pfa_indices[shift] is not None:
-                pfa_indices[shift] = torch.gather(pfa_indices[shift], dim=-1, index=topk_indices)
+                pfa_indices[shift] = torch.gather(
+                    pfa_indices[shift], dim=-1, index=topk_indices
+                )
             else:
                 pfa_indices[shift] = topk_indices
 
@@ -335,7 +359,16 @@ class WindowAttention(nn.Module):
             attn = attn.view(b_ * self.num_heads, n, topk)
             v = v.contiguous().view(b_ * self.num_heads, n, c // self.num_heads)
             smm_index = pfa_indices[shift].view(b_ * self.num_heads, n, topk).int()
-            x = (SMM_AmV.apply(attn, v, smm_index).view(b_, self.num_heads, n, c // self.num_heads)+ v_lepe).transpose(1, 2).reshape(b_, n, c)
+            x = (
+                (
+                    SMM_AmV.apply(attn, v, smm_index).view(
+                        b_, self.num_heads, n, c // self.num_heads
+                    )
+                    + v_lepe
+                )
+                .transpose(1, 2)
+                .reshape(b_, n, c)
+            )
 
         # only in inference. After use, delete unnecessary variables to free memory
         if not self.training:
@@ -346,7 +379,7 @@ class WindowAttention(nn.Module):
         return x, pfa_values, pfa_indices
 
     def extra_repr(self) -> str:
-        return f'dim={self.dim}, window_size={self.window_size}, num_heads={self.num_heads}, qkv_bias={self.qkv_bias}'
+        return f"dim={self.dim}, window_size={self.window_size}, num_heads={self.num_heads}, qkv_bias={self.qkv_bias}"
 
     def flops(self, n):
         flops = 0
@@ -357,12 +390,23 @@ class WindowAttention(nn.Module):
             flops += self.num_heads * n * n * (self.dim // self.num_heads)
         else:
             # attn = (q @ k.transpose(-2, -1))
-            flops += self.num_heads * n * (self.dim // self.num_heads) * self.num_topk[self.layer_id-2]
+            flops += (
+                self.num_heads
+                * n
+                * (self.dim // self.num_heads)
+                * self.num_topk[self.layer_id - 2]
+            )
             #  x = (attn @ v)
-            flops += self.num_heads * n * self.num_topk[self.layer_id] * (self.dim // self.num_heads)
+            flops += (
+                self.num_heads
+                * n
+                * self.num_topk[self.layer_id]
+                * (self.dim // self.num_heads)
+            )
         # x = self.proj(x)
         flops += n * self.dim * self.dim
         return flops
+
 
 class PFTransformerLayer(nn.Module):
     r"""
@@ -383,21 +427,22 @@ class PFTransformerLayer(nn.Module):
         norm_layer (nn.Module, optional): Normalization layer.  Default: nn.LayerNorm
     """
 
-    def __init__(self,
-                 dim,
-                 block_id,
-                 layer_id,
-                 input_resolution,
-                 num_heads,
-                 num_topk,
-                 window_size,
-                 shift_size,
-                 convffn_kernel_size,
-                 mlp_ratio,
-                 qkv_bias=True,
-                 act_layer=nn.GELU,
-                 norm_layer=nn.LayerNorm,
-                 ):
+    def __init__(
+        self,
+        dim,
+        block_id,
+        layer_id,
+        input_resolution,
+        num_heads,
+        num_topk,
+        window_size,
+        shift_size,
+        convffn_kernel_size,
+        mlp_ratio,
+        qkv_bias=True,
+        act_layer=nn.GELU,
+        norm_layer=nn.LayerNorm,
+    ):
         super().__init__()
 
         self.dim = dim
@@ -431,7 +476,12 @@ class PFTransformerLayer(nn.Module):
         )
 
         mlp_hidden_dim = int(dim * mlp_ratio)
-        self.convffn = ConvFFN(in_features=dim, hidden_features=mlp_hidden_dim, kernel_size=convffn_kernel_size,act_layer=act_layer)
+        self.convffn = ConvFFN(
+            in_features=dim,
+            hidden_features=mlp_hidden_dim,
+            kernel_size=convffn_kernel_size,
+            act_layer=act_layer,
+        )
 
     def forward(self, x, pfa_list, x_size, params):
         pfa_values, pfa_indices = pfa_list[0], pfa_list[1]
@@ -451,21 +501,38 @@ class PFTransformerLayer(nn.Module):
         # cyclic shift
         if self.shift_size > 0:
             shift = 1
-            shifted_x = torch.roll(x_qkvp.reshape(b, h, w, c4), shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
+            shifted_x = torch.roll(
+                x_qkvp.reshape(b, h, w, c4),
+                shifts=(-self.shift_size, -self.shift_size),
+                dims=(1, 2),
+            )
         else:
             shift = 0
             shifted_x = x_qkvp.reshape(b, h, w, c4)
         # partition windows
-        x_windows = window_partition(shifted_x, self.window_size)  # nw*b, window_size, window_size, c
-        x_windows = x_windows.view(-1, self.window_size * self.window_size, c4)  # nw*b, window_size*window_size, c
+        x_windows = window_partition(
+            shifted_x, self.window_size
+        )  # nw*b, window_size, window_size, c
+        x_windows = x_windows.view(
+            -1, self.window_size * self.window_size, c4
+        )  # nw*b, window_size*window_size, c
         # W-MSA/SW-MSA (to be compatible for testing on images whose shapes are the multiple of window size
-        attn_windows, pfa_values, pfa_indices = self.attn_win(x_windows, pfa_values=pfa_values, pfa_indices=pfa_indices, rpi=params['rpi_sa'], mask=params['attn_mask'], shift=shift)
+        attn_windows, pfa_values, pfa_indices = self.attn_win(
+            x_windows,
+            pfa_values=pfa_values,
+            pfa_indices=pfa_indices,
+            rpi=params["rpi_sa"],
+            mask=params["attn_mask"],
+            shift=shift,
+        )
         # merge windows
         attn_windows = attn_windows.view(-1, self.window_size, self.window_size, c)
         shifted_x = window_reverse(attn_windows, self.window_size, h, w)  # b h' w' c
         # reverse cyclic shift
         if self.shift_size > 0:
-            attn_x = torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
+            attn_x = torch.roll(
+                shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2)
+            )
         else:
             attn_x = shifted_x
 
@@ -490,14 +557,15 @@ class PFTransformerLayer(nn.Module):
 
         # mlp
         flops += 2 * h * w * self.dim * self.dim * self.mlp_ratio
-        flops += h * w * self.dim * (self.convffn_kernel_size ** 2) * self.mlp_ratio
+        flops += h * w * self.dim * (self.convffn_kernel_size**2) * self.mlp_ratio
         # lepe
-        flops += h * w * self.dim * (self.convlepe_kernel_size ** 2)
+        flops += h * w * self.dim * (self.convlepe_kernel_size**2)
 
         return flops
 
+
 class PatchMerging(nn.Module):
-    r""" Patch Merging Layer.
+    r"""Patch Merging Layer.
 
     Args:
         input_resolution (tuple[int]): Resolution of input feature.
@@ -518,8 +586,8 @@ class PatchMerging(nn.Module):
         """
         h, w = self.input_resolution
         b, seq_len, c = x.shape
-        assert seq_len == h * w, 'input feature has wrong size'
-        assert h % 2 == 0 and w % 2 == 0, f'x size ({h}*{w}) are not even.'
+        assert seq_len == h * w, "input feature has wrong size"
+        assert h % 2 == 0 and w % 2 == 0, f"x size ({h}*{w}) are not even."
 
         x = x.view(b, h, w, c)
 
@@ -536,7 +604,7 @@ class PatchMerging(nn.Module):
         return x
 
     def extra_repr(self) -> str:
-        return f'input_resolution={self.input_resolution}, dim={self.dim}'
+        return f"input_resolution={self.input_resolution}, dim={self.dim}"
 
     def flops(self, input_resolution=None):
         h, w = self.input_resolution if input_resolution is None else input_resolution
@@ -544,8 +612,9 @@ class PatchMerging(nn.Module):
         flops += (h // 2) * (w // 2) * 4 * self.dim * 2 * self.dim
         return flops
 
+
 class BasicBlock(nn.Module):
-    """ A basic PFT Block for one stage.
+    """A basic PFT Block for one stage.
 
     Args:
         dim (int): Number of input channels.
@@ -563,21 +632,23 @@ class BasicBlock(nn.Module):
         use_checkpoint (bool): Whether to use checkpointing to save memory. Default: False.
     """
 
-    def __init__(self,
-                 dim,
-                 input_resolution,
-                 idx,
-                 layer_id,
-                 depth,
-                 num_heads,
-                 num_topk,
-                 window_size,
-                 convffn_kernel_size,
-                 mlp_ratio=4.,
-                 qkv_bias=True,
-                 norm_layer=nn.LayerNorm,
-                 downsample=None,
-                 use_checkpoint=False, ):
+    def __init__(
+        self,
+        dim,
+        input_resolution,
+        idx,
+        layer_id,
+        depth,
+        num_heads,
+        num_topk,
+        window_size,
+        convffn_kernel_size,
+        mlp_ratio=4.0,
+        qkv_bias=True,
+        norm_layer=nn.LayerNorm,
+        downsample=None,
+        use_checkpoint=False,
+    ):
 
         super().__init__()
         self.dim = dim
@@ -591,7 +662,7 @@ class BasicBlock(nn.Module):
                 PFTransformerLayer(
                     dim=dim,
                     block_id=idx,
-                    layer_id= layer_id + i,
+                    layer_id=layer_id + i,
                     input_resolution=input_resolution,
                     num_heads=num_heads,
                     num_topk=num_topk,
@@ -606,13 +677,15 @@ class BasicBlock(nn.Module):
 
         # patch merging layer
         if downsample is not None:
-            self.downsample = downsample(input_resolution, dim=dim, norm_layer=norm_layer)
+            self.downsample = downsample(
+                input_resolution, dim=dim, norm_layer=norm_layer
+            )
         else:
             self.downsample = None
 
     def forward(self, x, pfa_list, x_size, params):
         for layer in self.layers:
-            #checkpoint_wrapper is not yet supported for PFT
+            # checkpoint_wrapper is not yet supported for PFT
             # idx_checkpoint = 4
             # if self.use_checkpoint and self.idx < idx_checkpoint:
             #     layer = checkpoint_wrapper(layer, offload_to_cpu=False)
@@ -623,15 +696,16 @@ class BasicBlock(nn.Module):
         return x, pfa_list
 
     def extra_repr(self) -> str:
-        return f'dim={self.dim}, input_resolution={self.input_resolution}, depth={self.depth}'
+        return f"dim={self.dim}, input_resolution={self.input_resolution}, depth={self.depth}"
 
     def flops(self, input_resolution=None):
         flops = 0
         for layer in self.layers:
-            flops += layer.flops(input_resolution)
+            flops += layer.flops(input_resolution)  # ty:ignore[call-non-callable]
         if self.downsample is not None:
             flops += self.downsample.flops(input_resolution)
         return flops
+
 
 class PFTB(nn.Module):
     """Adaptive Token Dictionary Block (PFTB).
@@ -653,34 +727,46 @@ class PFTB(nn.Module):
         resi_connection: The convolutional block before residual connection.
     """
 
-    def __init__(self,
-                 dim,
-                 idx,
-                 layer_id,
-                 input_resolution,
-                 depth,
-                 num_heads,
-                 num_topk,
-                 window_size,
-                 convffn_kernel_size,
-                 mlp_ratio,
-                 qkv_bias=True,
-                 norm_layer=nn.LayerNorm,
-                 downsample=None,
-                 use_checkpoint=False,
-                 img_size=224,
-                 patch_size=4,
-                 resi_connection='1conv', ):
+    def __init__(
+        self,
+        dim,
+        idx,
+        layer_id,
+        input_resolution,
+        depth,
+        num_heads,
+        num_topk,
+        window_size,
+        convffn_kernel_size,
+        mlp_ratio,
+        qkv_bias=True,
+        norm_layer=nn.LayerNorm,
+        downsample=None,
+        use_checkpoint=False,
+        img_size=224,
+        patch_size=4,
+        resi_connection="1conv",
+    ):
         super(PFTB, self).__init__()
 
         self.dim = dim
         self.input_resolution = input_resolution
 
         self.patch_embed = PatchEmbed(
-            img_size=img_size, patch_size=patch_size, in_chans=0, embed_dim=dim, norm_layer=None)
+            img_size=img_size,
+            patch_size=patch_size,
+            in_chans=0,
+            embed_dim=dim,
+            norm_layer=None,
+        )
 
         self.patch_unembed = PatchUnEmbed(
-            img_size=img_size, patch_size=patch_size, in_chans=0, embed_dim=dim, norm_layer=None)
+            img_size=img_size,
+            patch_size=patch_size,
+            in_chans=0,
+            embed_dim=dim,
+            norm_layer=None,
+        )
 
         self.residual_group = BasicBlock(
             dim=dim,
@@ -699,18 +785,23 @@ class PFTB(nn.Module):
             use_checkpoint=use_checkpoint,
         )
 
-        if resi_connection == '1conv':
+        if resi_connection == "1conv":
             self.conv = nn.Conv2d(dim, dim, 3, 1, 1)
-        elif resi_connection == '3conv':
+        elif resi_connection == "3conv":
             # to save parameters and memory
             self.conv = nn.Sequential(
-                nn.Conv2d(dim, dim // 4, 3, 1, 1), nn.LeakyReLU(negative_slope=0.2, inplace=True),
-                nn.Conv2d(dim // 4, dim // 4, 1, 1, 0), nn.LeakyReLU(negative_slope=0.2, inplace=True),
-                nn.Conv2d(dim // 4, dim, 3, 1, 1))
+                nn.Conv2d(dim, dim // 4, 3, 1, 1),
+                nn.LeakyReLU(negative_slope=0.2, inplace=True),
+                nn.Conv2d(dim // 4, dim // 4, 1, 1, 0),
+                nn.LeakyReLU(negative_slope=0.2, inplace=True),
+                nn.Conv2d(dim // 4, dim, 3, 1, 1),
+            )
 
     def forward(self, x, pfa_list, x_size, params):
         x_Basicblock, pfa_list = self.residual_group(x, pfa_list, x_size, params)
-        return self.patch_embed(self.conv(self.patch_unembed(x_Basicblock, x_size))) + x, pfa_list
+        return self.patch_embed(
+            self.conv(self.patch_unembed(x_Basicblock, x_size))
+        ) + x, pfa_list
 
     def flops(self, input_resolution=None):
         flops = 0
@@ -722,8 +813,9 @@ class PFTB(nn.Module):
 
         return flops
 
+
 class PatchEmbed(nn.Module):
-    r""" Image to Patch Embedding
+    r"""Image to Patch Embedding
 
     Args:
         img_size (int): Image size.  Default: 224.
@@ -733,11 +825,16 @@ class PatchEmbed(nn.Module):
         norm_layer (nn.Module, optional): Normalization layer. Default: None
     """
 
-    def __init__(self, img_size=224, patch_size=4, in_chans=3, embed_dim=96, norm_layer=None):
+    def __init__(
+        self, img_size=224, patch_size=4, in_chans=3, embed_dim=96, norm_layer=None
+    ):
         super().__init__()
         img_size = to_2tuple(img_size)
         patch_size = to_2tuple(patch_size)
-        patches_resolution = [img_size[0] // patch_size[0], img_size[1] // patch_size[1]]
+        patches_resolution = [
+            img_size[0] // patch_size[0],
+            img_size[1] // patch_size[1],
+        ]
         self.img_size = img_size
         self.patch_size = patch_size
         self.patches_resolution = patches_resolution
@@ -764,8 +861,9 @@ class PatchEmbed(nn.Module):
             flops += h * w * self.embed_dim
         return flops
 
+
 class PatchUnEmbed(nn.Module):
-    r""" Image to Patch Unembedding
+    r"""Image to Patch Unembedding
 
     Args:
         img_size (int): Image size.  Default: 224.
@@ -775,11 +873,16 @@ class PatchUnEmbed(nn.Module):
         norm_layer (nn.Module, optional): Normalization layer. Default: None
     """
 
-    def __init__(self, img_size=224, patch_size=4, in_chans=3, embed_dim=96, norm_layer=None):
+    def __init__(
+        self, img_size=224, patch_size=4, in_chans=3, embed_dim=96, norm_layer=None
+    ):
         super().__init__()
         img_size = to_2tuple(img_size)
         patch_size = to_2tuple(patch_size)
-        patches_resolution = [img_size[0] // patch_size[0], img_size[1] // patch_size[1]]
+        patches_resolution = [
+            img_size[0] // patch_size[0],
+            img_size[1] // patch_size[1],
+        ]
         self.img_size = img_size
         self.patch_size = patch_size
         self.patches_resolution = patches_resolution
@@ -789,12 +892,15 @@ class PatchUnEmbed(nn.Module):
         self.embed_dim = embed_dim
 
     def forward(self, x, x_size):
-        x = x.transpose(1, 2).view(x.shape[0], self.embed_dim, x_size[0], x_size[1])  # b Ph*Pw c
+        x = x.transpose(1, 2).view(
+            x.shape[0], self.embed_dim, x_size[0], x_size[1]
+        )  # b Ph*Pw c
         return x
 
     def flops(self, input_resolution=None):
         flops = 0
         return flops
+
 
 class Upsample(nn.Sequential):
     """Upsample module.
@@ -818,19 +924,30 @@ class Upsample(nn.Sequential):
             # m.append(nn.Conv2d(num_feat, 9 * num_feat, 5, 1, 2))
             m.append(nn.PixelShuffle(3))
         else:
-            raise ValueError(f'scale {scale} is not supported. Supported scales: 2^n and 3.')
+            raise ValueError(
+                f"scale {scale} is not supported. Supported scales: 2^n and 3."
+            )
         super(Upsample, self).__init__(*m)
 
     def flops(self, input_resolution):
         flops = 0
         x, y = input_resolution
         if (self.scale & (self.scale - 1)) == 0:
-            flops += self.num_feat * 4 * self.num_feat * 9 * x * y * int(math.log(self.scale, 2))
+            flops += (
+                self.num_feat
+                * 4
+                * self.num_feat
+                * 9
+                * x
+                * y
+                * int(math.log(self.scale, 2))
+            )
             # flops += self.num_feat * 4 * self.num_feat * 25 * x * y * int(math.log(self.scale, 2))
         else:
             flops += self.num_feat * 9 * self.num_feat * 9 * x * y
             # flops += self.num_feat * 9 * self.num_feat * 25 * x * y
         return flops
+
 
 class UpsampleOneStep(nn.Sequential):
     """UpsampleOneStep module (the difference with Upsample is that it always only has 1conv + 1pixelshuffle)
@@ -846,19 +963,20 @@ class UpsampleOneStep(nn.Sequential):
         self.num_feat = num_feat
         self.input_resolution = input_resolution
         m = []
-        m.append(nn.Conv2d(num_feat, (scale ** 2) * num_out_ch, 3, 1, 1))
+        m.append(nn.Conv2d(num_feat, (scale**2) * num_out_ch, 3, 1, 1))
         m.append(nn.PixelShuffle(scale))
         super(UpsampleOneStep, self).__init__(*m)
 
     def flops(self, input_resolution):
         flops = 0
-        h, w = self.patches_resolution if input_resolution is None else input_resolution
+        h, w = self.patches_resolution if input_resolution is None else input_resolution  # ty:ignore[not-iterable]
         flops = h * w * self.num_feat * 3 * 9
         return flops
 
+
 @ARCH_REGISTRY.register()
 class PFT(nn.Module):
-    r""" PFT
+    r"""PFT
         A PyTorch impl of : `Progressive Focused Transformer for Single Image Super-Resolution`.
 
     Args:
@@ -883,27 +1001,54 @@ class PFT(nn.Module):
         resi_connection: The convolutional block before residual connection. '1conv'/'3conv'
     """
 
-    def __init__(self,
-                 img_size=64,
-                 patch_size=1,
-                 in_chans=3,
-                 embed_dim=90,
-                 depths=(6, 6, 6, 6),
-                 num_heads=(6, 6, 6, 6),
-                 num_topk=[256, 256,  128, 128, 128, 128,  64, 64, 64, 64, 64, 64,  32, 32, 32, 32, 32, 32,  16, 16, 16, 16, 16, 16],
-                 window_size=8,
-                 convffn_kernel_size=5,
-                 mlp_ratio=2.,
-                 qkv_bias=True,
-                 norm_layer=nn.LayerNorm,
-                 ape=False,
-                 patch_norm=True,
-                 use_checkpoint=False,
-                 upscale=2,
-                 img_range=1.,
-                 upsampler='',
-                 resi_connection='1conv',
-                 **kwargs):
+    def __init__(
+        self,
+        img_size=64,
+        patch_size=1,
+        in_chans=3,
+        embed_dim=90,
+        depths=(6, 6, 6, 6),
+        num_heads=(6, 6, 6, 6),
+        num_topk=[
+            256,
+            256,
+            128,
+            128,
+            128,
+            128,
+            64,
+            64,
+            64,
+            64,
+            64,
+            64,
+            32,
+            32,
+            32,
+            32,
+            32,
+            32,
+            16,
+            16,
+            16,
+            16,
+            16,
+            16,
+        ],
+        window_size=8,
+        convffn_kernel_size=5,
+        mlp_ratio=2.0,
+        qkv_bias=True,
+        norm_layer=nn.LayerNorm,
+        ape=False,
+        patch_norm=True,
+        use_checkpoint=False,
+        upscale=2,
+        img_range=1.0,
+        upsampler="",
+        resi_connection="1conv",
+        **kwargs,
+    ):
         super().__init__()
         num_in_ch = in_chans
         num_out_ch = in_chans
@@ -936,7 +1081,8 @@ class PFT(nn.Module):
             patch_size=patch_size,
             in_chans=embed_dim,
             embed_dim=embed_dim,
-            norm_layer=norm_layer if self.patch_norm else None)
+            norm_layer=norm_layer if self.patch_norm else None,
+        )
         num_patches = self.patch_embed.num_patches
         patches_resolution = self.patch_embed.patches_resolution
         self.patches_resolution = patches_resolution
@@ -947,16 +1093,19 @@ class PFT(nn.Module):
             patch_size=patch_size,
             in_chans=embed_dim,
             embed_dim=embed_dim,
-            norm_layer=norm_layer if self.patch_norm else None)
+            norm_layer=norm_layer if self.patch_norm else None,
+        )
 
         # absolute position embedding
         if self.ape:
-            self.absolute_pos_embed = nn.Parameter(torch.zeros(1, num_patches, embed_dim))
-            trunc_normal_(self.absolute_pos_embed, std=.02)
+            self.absolute_pos_embed = nn.Parameter(
+                torch.zeros(1, num_patches, embed_dim)
+            )
+            trunc_normal_(self.absolute_pos_embed, std=0.02)
 
         # relative position index
         relative_position_index_SA = self.calculate_rpi_sa()
-        self.register_buffer('relative_position_index_SA', relative_position_index_SA)
+        self.register_buffer("relative_position_index_SA", relative_position_index_SA)
 
         # build Residual Adaptive Token Dictionary Blocks (PFTB)
         self.layers = nn.ModuleList()
@@ -986,34 +1135,43 @@ class PFT(nn.Module):
         self.norm = norm_layer(self.num_features)
 
         # build the last conv layer in deep feature extraction
-        if resi_connection == '1conv':
+        if resi_connection == "1conv":
             self.conv_after_body = nn.Conv2d(embed_dim, embed_dim, 3, 1, 1)
             # self.conv_after_body = nn.Conv2d(embed_dim, embed_dim, 5, 1, 2)
-        elif resi_connection == '3conv':
+        elif resi_connection == "3conv":
             # to save parameters and memory
             self.conv_after_body = nn.Sequential(
-                nn.Conv2d(embed_dim, embed_dim // 4, 3, 1, 1), nn.LeakyReLU(negative_slope=0.2, inplace=True),
-                nn.Conv2d(embed_dim // 4, embed_dim // 4, 1, 1, 0), nn.LeakyReLU(negative_slope=0.2, inplace=True),
-                nn.Conv2d(embed_dim // 4, embed_dim, 3, 1, 1))
+                nn.Conv2d(embed_dim, embed_dim // 4, 3, 1, 1),
+                nn.LeakyReLU(negative_slope=0.2, inplace=True),
+                nn.Conv2d(embed_dim // 4, embed_dim // 4, 1, 1, 0),
+                nn.LeakyReLU(negative_slope=0.2, inplace=True),
+                nn.Conv2d(embed_dim // 4, embed_dim, 3, 1, 1),
+            )
 
         # ------------------------- 3, high quality image reconstruction ------------------------- #
-        if self.upsampler == 'pixelshuffle':
+        if self.upsampler == "pixelshuffle":
             # for classical SR
             self.conv_before_upsample = nn.Sequential(
-                nn.Conv2d(embed_dim, num_feat, 3, 1, 1), nn.LeakyReLU(inplace=True))
-                # nn.Conv2d(embed_dim, num_feat, 5, 1, 2), nn.LeakyReLU(inplace=True))
+                nn.Conv2d(embed_dim, num_feat, 3, 1, 1), nn.LeakyReLU(inplace=True)
+            )
+            # nn.Conv2d(embed_dim, num_feat, 5, 1, 2), nn.LeakyReLU(inplace=True))
             self.upsample = Upsample(upscale, num_feat)
             self.conv_last = nn.Conv2d(num_feat, num_out_ch, 3, 1, 1)
             # self.conv_last = nn.Conv2d(num_feat, num_out_ch, 5, 1, 2)
-        elif self.upsampler == 'pixelshuffledirect':
+        elif self.upsampler == "pixelshuffledirect":
             # for lightweight SR (to save parameters)
-            self.upsample = UpsampleOneStep(upscale, embed_dim, num_out_ch,
-                                            (patches_resolution[0], patches_resolution[1]))
-        elif self.upsampler == 'nearest+conv':
+            self.upsample = UpsampleOneStep(
+                upscale,
+                embed_dim,
+                num_out_ch,
+                (patches_resolution[0], patches_resolution[1]),
+            )
+        elif self.upsampler == "nearest+conv":
             # for real-world SR (less artifacts)
-            assert self.upscale == 4, 'only support x4 now.'
+            assert self.upscale == 4, "only support x4 now."
             self.conv_before_upsample = nn.Sequential(
-                nn.Conv2d(embed_dim, num_feat, 3, 1, 1), nn.LeakyReLU(inplace=True))
+                nn.Conv2d(embed_dim, num_feat, 3, 1, 1), nn.LeakyReLU(inplace=True)
+            )
             self.conv_up1 = nn.Conv2d(num_feat, num_feat, 3, 1, 1)
             self.conv_up2 = nn.Conv2d(num_feat, num_feat, 3, 1, 1)
             self.conv_hr = nn.Conv2d(num_feat, num_feat, 3, 1, 1)
@@ -1027,7 +1185,7 @@ class PFT(nn.Module):
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
-            trunc_normal_(m.weight, std=.02)
+            trunc_normal_(m.weight, std=0.02)
             if isinstance(m, nn.Linear) and m.bias is not None:
                 nn.init.constant_(m.bias, 0)
         elif isinstance(m, nn.LayerNorm):
@@ -1036,11 +1194,11 @@ class PFT(nn.Module):
 
     @torch.jit.ignore
     def no_weight_decay(self):
-        return {'absolute_pos_embed'}
+        return {"absolute_pos_embed"}
 
     @torch.jit.ignore
     def no_weight_decay_keywords(self):
-        return {'relative_position_bias_table'}
+        return {"relative_position_bias_table"}
 
     def forward_features(self, x, params):
         x_size = (x.shape[2], x.shape[3])
@@ -1068,8 +1226,12 @@ class PFT(nn.Module):
         coords_w = torch.arange(self.window_size)
         coords = torch.stack(torch.meshgrid([coords_h, coords_w]))  # 2, Wh, Ww
         coords_flatten = torch.flatten(coords, 1)  # 2, Wh*Ww
-        relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]  # 2, Wh*Ww, Wh*Ww
-        relative_coords = relative_coords.permute(1, 2, 0).contiguous()  # Wh*Ww, Wh*Ww, 2
+        relative_coords = (
+            coords_flatten[:, :, None] - coords_flatten[:, None, :]
+        )  # 2, Wh*Ww, Wh*Ww
+        relative_coords = relative_coords.permute(
+            1, 2, 0
+        ).contiguous()  # Wh*Ww, Wh*Ww, 2
         relative_coords[:, :, 0] += self.window_size - 1  # shift to start from 0
         relative_coords[:, :, 1] += self.window_size - 1
         relative_coords[:, :, 0] *= 2 * self.window_size - 1
@@ -1080,20 +1242,30 @@ class PFT(nn.Module):
         # calculate attention mask for SW-MSA
         h, w = x_size
         img_mask = torch.zeros((1, h, w, 1))  # 1 h w 1
-        h_slices = (slice(0, -self.window_size), slice(-self.window_size,
-                                                       -(self.window_size // 2)), slice(-(self.window_size // 2), None))
-        w_slices = (slice(0, -self.window_size), slice(-self.window_size,
-                                                       -(self.window_size // 2)), slice(-(self.window_size // 2), None))
+        h_slices = (
+            slice(0, -self.window_size),
+            slice(-self.window_size, -(self.window_size // 2)),
+            slice(-(self.window_size // 2), None),
+        )
+        w_slices = (
+            slice(0, -self.window_size),
+            slice(-self.window_size, -(self.window_size // 2)),
+            slice(-(self.window_size // 2), None),
+        )
         cnt = 0
         for h in h_slices:
             for w in w_slices:
                 img_mask[:, h, w, :] = cnt
                 cnt += 1
 
-        mask_windows = window_partition(img_mask, self.window_size)  # nw, window_size, window_size, 1
+        mask_windows = window_partition(
+            img_mask, self.window_size
+        )  # nw, window_size, window_size, 1
         mask_windows = mask_windows.view(-1, self.window_size * self.window_size)
         attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
-        attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))
+        attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(
+            attn_mask == 0, float(0.0)
+        )
 
         return attn_mask
 
@@ -1110,50 +1282,60 @@ class PFT(nn.Module):
         x = (x - self.mean) * self.img_range
 
         attn_mask = self.calculate_mask([h, w]).to(x.device)
-        params = {'attn_mask': attn_mask, 'rpi_sa': self.relative_position_index_SA}
+        params = {"attn_mask": attn_mask, "rpi_sa": self.relative_position_index_SA}
 
-        if self.upsampler == 'pixelshuffle':
+        if self.upsampler == "pixelshuffle":
             # for classical SR
             x = self.conv_first(x)
             x = self.conv_after_body(self.forward_features(x, params)) + x
             x = self.conv_before_upsample(x)
             x = self.conv_last(self.upsample(x))
-        elif self.upsampler == 'pixelshuffledirect':
+        elif self.upsampler == "pixelshuffledirect":
             # for lightweight SR
             x = self.conv_first(x)
             x = self.conv_after_body(self.forward_features(x, params)) + x
             x = self.upsample(x)
-        elif self.upsampler == 'nearest+conv':
+        elif self.upsampler == "nearest+conv":
             # for real-world SR
             x = self.conv_first(x)
             x = self.conv_after_body(self.forward_features(x, params)) + x
             x = self.conv_before_upsample(x)
-            x = self.lrelu(self.conv_up1(torch.nn.functional.interpolate(x, scale_factor=2, mode='nearest')))
-            x = self.lrelu(self.conv_up2(torch.nn.functional.interpolate(x, scale_factor=2, mode='nearest')))
+            x = self.lrelu(
+                self.conv_up1(
+                    torch.nn.functional.interpolate(x, scale_factor=2, mode="nearest")
+                )
+            )
+            x = self.lrelu(
+                self.conv_up2(
+                    torch.nn.functional.interpolate(x, scale_factor=2, mode="nearest")
+                )
+            )
             x = self.conv_last(self.lrelu(self.conv_hr(x)))
         else:
             # for image denoising and JPEG compression artifact reduction
             x_first = self.conv_first(x)
-            res = self.conv_after_body(self.forward_features(x_first)) + x_first
+            res = self.conv_after_body(self.forward_features(x_first)) + x_first  # ty:ignore[missing-argument]
             x = x + self.conv_last(res)
 
         x = x / self.img_range + self.mean
 
         # unpadding
-        x = x[..., :h_ori * self.upscale, :w_ori * self.upscale]
+        x = x[..., : h_ori * self.upscale, : w_ori * self.upscale]
 
         return x
 
     def flops(self, input_resolution=None):
         flops = 0
-        resolution = self.patches_resolution if input_resolution is None else input_resolution
+        resolution = (
+            self.patches_resolution if input_resolution is None else input_resolution
+        )
         h, w = resolution
         flops += h * w * 3 * self.embed_dim * 9
         flops += self.patch_embed.flops(resolution)
         for layer in self.layers:
-            flops += layer.flops(resolution)
+            flops += layer.flops(resolution)  # ty:ignore[call-non-callable]
         flops += h * w * 3 * self.embed_dim * self.embed_dim
-        if self.upsampler == 'pixelshuffle':
+        if self.upsampler == "pixelshuffle":
             flops += self.upsample.flops(resolution)
         else:
             flops += self.upsample.flops(resolution)
@@ -1161,7 +1343,7 @@ class PFT(nn.Module):
         return flops
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     upscale = 2
     model = PFT(
         upscale=2,
@@ -1169,31 +1351,53 @@ if __name__ == '__main__':
         embed_dim=240,
         depths=[4, 4, 4, 6, 6, 6],
         num_heads=6,
-        num_topk = [1024, 1024, 1024, 1024,
-                      256, 256, 256, 256,
-                      128, 128, 128, 128,
-                      64, 64, 64, 64, 64, 64,
-                      32, 32, 32, 32, 32, 32,
-                      16, 16, 16, 16, 16, 16,],
-
+        num_topk=[
+            1024,
+            1024,
+            1024,
+            1024,
+            256,
+            256,
+            256,
+            256,
+            128,
+            128,
+            128,
+            128,
+            64,
+            64,
+            64,
+            64,
+            64,
+            64,
+            32,
+            32,
+            32,
+            32,
+            32,
+            32,
+            16,
+            16,
+            16,
+            16,
+            16,
+            16,
+        ],
         window_size=32,
         convffn_kernel_size=7,
-        img_range=1.,
+        img_range=1.0,
         mlp_ratio=2,
-        upsampler = 'pixelshuffle',
+        upsampler="pixelshuffle",
     )
 
     # Parameters and computational complexity
     total = sum([param.nelement() for param in model.parameters()])
     print("Number of parameter: %.3fM" % (total / 1e6))
-    print(640, 360, model.flops([640, 360]) / 1e9, 'G')
-    print(426, 240, model.flops([426, 240]) / 1e9, 'G')
-    print(320, 180, model.flops([320, 180]) / 1e9, 'G')
+    print(640, 360, model.flops([640, 360]) / 1e9, "G")
+    print(426, 240, model.flops([426, 240]) / 1e9, "G")
+    print(320, 180, model.flops([320, 180]) / 1e9, "G")
 
     # # Test
     # _input = torch.randn([1, 3, 640, 360])
     # output = model(_input)[0]
     # print(output.shape)
-
-
-

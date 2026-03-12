@@ -40,9 +40,6 @@ conda activate PFT
 
 pip install -r requirements.txt
 python setup.py develop
-
-cd ./ops_smm
-./make.sh
 ```
 
 ## Inference
