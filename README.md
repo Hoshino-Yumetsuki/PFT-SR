@@ -1,4 +1,4 @@
-# [CVPR 2025] Progressive Focused Transformer for Single Image Super-Resolution
+# [跨平台&推理优化] [CVPR 2025] Progressive Focused Transformer for Single Image Super-Resolution
 
 This repository is an official implementation of the paper "Progressive Focused Transformer for Single Image Super-Resolution", CVPR, 2025.
 
