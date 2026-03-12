@@ -63,7 +63,7 @@ def build_dataloader(dataset, dataset_opt, num_gpu=1, dist=False, sampler=None, 
             multiplier = 1 if num_gpu == 0 else num_gpu
             batch_size = dataset_opt['batch_size_per_gpu'] * multiplier
             num_workers = dataset_opt['num_worker_per_gpu'] * multiplier
-        dataloader_args = dict(
+        dataloader_args: dict = dict(
             dataset=dataset,
             batch_size=batch_size,
             shuffle=False,
@@ -75,12 +75,12 @@ def build_dataloader(dataset, dataset_opt, num_gpu=1, dist=False, sampler=None, 
         dataloader_args['worker_init_fn'] = partial(
             worker_init_fn, num_workers=num_workers, rank=rank, seed=seed) if seed is not None else None
     elif phase in ['val', 'test']:  # validation
-        dataloader_args = dict(dataset=dataset, batch_size=1, shuffle=False, num_workers=0)
+        dataloader_args: dict = dict(dataset=dataset, batch_size=1, shuffle=False, num_workers=0)
     else:
         raise ValueError(f"Wrong dataset phase: {phase}. Supported ones are 'train', 'val' and 'test'.")
 
-    dataloader_args['pin_memory'] = dataset_opt.get('pin_memory', False)
-    dataloader_args['persistent_workers'] = dataset_opt.get('persistent_workers', False)
+    dataloader_args['pin_memory'] = bool(dataset_opt.get('pin_memory', False))
+    dataloader_args['persistent_workers'] = bool(dataset_opt.get('persistent_workers', False))
 
     prefetch_mode = dataset_opt.get('prefetch_mode')
     if prefetch_mode == 'cpu':  # CPUPrefetcher

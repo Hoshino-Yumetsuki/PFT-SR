@@ -1,7 +1,6 @@
 import torch
 
 from basicsr.utils.registry import MODEL_REGISTRY
-from .base_model import BaseModel
 from .sr_model import SRModel
 import torch.nn.functional as F
 
@@ -18,7 +17,7 @@ class PFTModel(SRModel):
     #         with torch.no_grad():
     #             self.output = self.net_g(self.lq)
     #         self.net_g.train()
-    
+
     ### patchwise_testing (modified from https://github.com/csguoh/MambaIR)
     def test(self):
         _, C, h, w = self.lq.size()

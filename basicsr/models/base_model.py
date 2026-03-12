@@ -1,6 +1,7 @@
 import os
 import time
 import torch
+import torch.distributed as dist
 from collections import OrderedDict
 from copy import deepcopy
 from torch.nn.parallel import DataParallel, DistributedDataParallel
@@ -20,6 +21,7 @@ class BaseModel():
         self.is_train = opt['is_train']
         self.schedulers = []
         self.optimizers = []
+        self.log_dict = OrderedDict()
 
     def feed_data(self, data):
         pass
@@ -48,6 +50,14 @@ class BaseModel():
         else:
             self.nondist_validation(dataloader, current_iter, tb_logger, save_img)
 
+    def dist_validation(self, dataloader, current_iter, tb_logger, save_img):
+        """Distributed validation. Override in subclass for custom behavior."""
+        self.nondist_validation(dataloader, current_iter, tb_logger, save_img)
+
+    def nondist_validation(self, dataloader, current_iter, tb_logger, save_img):
+        """Non-distributed validation. Override in subclass."""
+        pass
+
     def _initialize_best_metric_results(self, dataset_name):
         """Initialize the best metric results dict for recording the best metric value and iteration."""
         if hasattr(self, 'best_metric_results') and dataset_name in self.best_metric_results:
@@ -74,10 +84,13 @@ class BaseModel():
                 self.best_metric_results[dataset_name][metric]['iter'] = current_iter
 
     def model_ema(self, decay=0.999):
+        if not hasattr(self, 'net_g_ema'):
+            return
         net_g = self.get_bare_model(self.net_g)
+        net_g_ema = self.get_bare_model(self.net_g_ema)
 
         net_g_params = dict(net_g.named_parameters())
-        net_g_ema_params = dict(self.net_g_ema.named_parameters())
+        net_g_ema_params = dict(net_g_ema.named_parameters())
 
         for k in net_g_ema_params.keys():
             net_g_ema_params[k].data.mul_(decay).add_(net_g_params[k].data, alpha=1 - decay)
@@ -384,7 +397,7 @@ class BaseModel():
                     keys.append(name)
                     losses.append(value)
                 losses = torch.stack(losses, 0)
-                torch.distributed.reduce(losses, dst=0)
+                dist.reduce(losses, dst=0)  # type: ignore[attr-defined]
                 if self.opt['rank'] == 0:
                     losses /= self.opt['world_size']
                 loss_dict = {key: loss for key, loss in zip(keys, losses)}

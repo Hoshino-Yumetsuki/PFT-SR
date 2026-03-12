@@ -13,8 +13,9 @@ def reduce_loss(loss, reduction):
     Returns:
         Tensor: Reduced loss tensor.
     """
-    reduction_enum = F._Reduction.get_enum(reduction)
     # none: 0, elementwise_mean:1, sum: 2
+    reduction_map = {'none': 0, 'mean': 1, 'sum': 2}
+    reduction_enum = reduction_map[reduction]
     if reduction_enum == 0:
         return loss
     elif reduction_enum == 1:

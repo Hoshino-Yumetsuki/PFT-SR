@@ -9,23 +9,31 @@ This repository is an official implementation of the paper "Progressive Focused 
 By [Wei Long](https://scholar.google.com/citations?user=CsVTBJoAAAAJ), [Xingyu Zhou](https://scholar.google.com/citations?user=dgO3CyMAAAAJ), [Leheng Zhang](https://scholar.google.com/citations?user=DH1CJqkAAAAJ), and [Shuhang Gu](https://scholar.google.com/citations?user=-kSTt40AAAAJ).
 
 > **Abstract:** Transformer-based methods have achieved remarkable results in image super-resolution tasks because they can capture non-local dependencies in low-quality input images. However, this feature-intensive modeling approach is computationally expensive because it calculates the similarities between numerous features that are irrelevant to the query features when obtaining attention weights. These unnecessary similarity calculations not only degrade the reconstruction performance but also introduce significant computational overhead. How to accurately identify the features that are important to the current query features and avoid similarity calculations between irrelevant features remains an urgent problem. To address this issue, we propose a novel and effective **P**rogressive **F**ocused **T**ransformer (**PFT**) that links all isolated attention maps in the network through Progressive Focused Attention (PFA) to focus attention on the most important tokens. PFA not only enables the network to capture more critical similar features, but also significantly reduces the computational cost of the overall network by filtering out irrelevant features before calculating similarities. Extensive experiments demonstrate the effectiveness of the proposed method, achieving state-of-the-art performance on various single image super-resolution benchmarks..
-> 
-> <img width="800" src="figures/pft_m.png"> 
+>
+> <img width="800" src="figures/pft_m.png">
 > <br/>
-> <img width="800" src="figures/PFT.png"> 
+> <img width="800" src="figures/PFT.png">
 
 
 
 ## Contents
-1. [Enviroment](#environment)
-1. [Inference](#inference)
-1. [Training](#training)
-1. [Testing](#testing)
-1. [Results](#results)
-1. [Visual Results](#visual-results)
-1. [Visualization of Attention Distributions](#visualization-of-attention-distributions)
-1. [Acknowledgements](#acknowledgements)
-1. [Citation](#citation)
+- [\[CVPR 2025\] Progressive Focused Transformer for Single Image Super-Resolution](#cvpr-2025-progressive-focused-transformer-for-single-image-super-resolution)
+  - [Contents](#contents)
+  - [Environment](#environment)
+    - [Installation](#installation)
+  - [Inference](#inference)
+  - [Training](#training)
+    - [Data Preparation](#data-preparation)
+    - [Training Commands](#training-commands)
+  - [Testing](#testing)
+    - [Data Preparation](#data-preparation-1)
+    - [Pretrained Models](#pretrained-models)
+    - [Testing Commands](#testing-commands)
+  - [Results](#results)
+  - [Visual Results](#visual-results)
+  - [Visualization of Attention Distributions](#visualization-of-attention-distributions)
+  - [Acknowledgements](#acknowledgements)
+  - [Citation](#citation)
 
 ## Environment
 - Python 3.9

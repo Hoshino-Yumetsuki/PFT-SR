@@ -156,7 +156,7 @@ class WeightedTVLoss(L1Loss):
             raise ValueError(f'Unsupported reduction mode: {reduction}. Supported ones are: mean | sum')
         super(WeightedTVLoss, self).__init__(loss_weight=loss_weight, reduction=reduction)
 
-    def forward(self, pred, weight=None):
+    def forward(self, pred, target=None, weight=None, **kwargs):
         if weight is None:
             y_weight = None
             x_weight = None

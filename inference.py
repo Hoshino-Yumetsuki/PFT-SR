@@ -110,7 +110,7 @@ def patchwise_inference(img, model, patch_size, scale, fp16, device):
     for top, left in tqdm(slices, desc="Processing patches", unit="patch"):
         patch = img[..., top, left]
         if fp16 and device != "cpu":
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast('cuda'):
                 out = model(patch)
         else:
             out = model(patch)
@@ -148,13 +148,13 @@ def process_image(
             image_output = patchwise_inference(
                 image_input, model, patch_size, scale, fp16, device
             )
-            image_output = image_output.clamp(0.0, 1.0)[0].cpu()
+            image_output = torch.nan_to_num(image_output).clamp(0.0, 1.0)[0].cpu()
         else:
             if fp16 and device != "cpu":
-                with torch.cuda.amp.autocast():
-                    image_output = model(image_input).clamp(0.0, 1.0)[0].cpu()
+                with torch.amp.autocast('cuda'):
+                    image_output = torch.nan_to_num(model(image_input)).clamp(0.0, 1.0)[0].cpu()
             else:
-                image_output = model(image_input).clamp(0.0, 1.0)[0].cpu()
+                image_output = torch.nan_to_num(model(image_input)).clamp(0.0, 1.0)[0].cpu()
 
         image_output = transforms.ToPILImage()(image_output)
         image_output.save(image_output_path)
