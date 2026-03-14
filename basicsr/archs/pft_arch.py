@@ -1233,11 +1233,12 @@ class PFT(nn.Module):
         pfa_indices = [None, None]
         pfa_list = [pfa_values, pfa_indices]
 
-        # Use autocast for automatic mixed precision when input is fp16
+        # Use autocast for automatic mixed precision when input is fp16 or bf16
         input_dtype = x.dtype
-        use_amp = input_dtype == torch.float16
+        use_amp = input_dtype in (torch.float16, torch.bfloat16)
+        amp_dtype = input_dtype if use_amp else torch.float32
 
-        with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.float16):
+        with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
             x = self.patch_embed(x)
             if self.ape:
                 x = x + self.absolute_pos_embed
@@ -1249,8 +1250,8 @@ class PFT(nn.Module):
             x = self.patch_unembed(x, x_size)
 
         # Ensure output matches input dtype
-        if input_dtype == torch.float16 and x.dtype != torch.float16:
-            x = x.half()
+        if input_dtype in (torch.float16, torch.bfloat16) and x.dtype != input_dtype:
+            x = x.to(dtype=input_dtype)
 
         return x
 

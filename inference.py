@@ -68,6 +68,13 @@ def get_parser(**parser_kwargs):
         default=1,
         help="Number of patches to process in parallel. Higher = faster but uses MUCH more VRAM. Default 1 is safest for 8 GB GPUs.",
     )
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        default="bf16",
+        choices=["fp32", "bf16"],
+        help="Data type for inference. bf16: bfloat16 (default, best stability), fp32: full precision, fp16: half precision (may overflow).",
+    )
     args = parser.parse_args()
 
     return args
@@ -196,7 +203,7 @@ def process_image(
 
         # Debug: Check for NaN/Inf before processing
         if torch.isnan(image_output).any() or torch.isinf(image_output).any():
-            print(f"WARNING: Output contains NaN or Inf values!")
+            print("WARNING: Output contains NaN or Inf values!")
             print(f"  NaN count: {torch.isnan(image_output).sum().item()}")
             print(f"  Inf count: {torch.isinf(image_output).sum().item()}")
             print(
@@ -307,6 +314,14 @@ def main():
     )["params_ema"]
     model.load_state_dict(state_dict, strict=True)
     model = model.to(device)
+
+    # Convert model to specified dtype
+    if args.dtype == "fp16":
+        model = model.half()
+    elif args.dtype == "bf16":
+        model = model.to(dtype=torch.bfloat16)
+    # fp32 is default, no conversion needed
+
     model.eval()
 
     if args.compile and hasattr(torch, "compile"):
